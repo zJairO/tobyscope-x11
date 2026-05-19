@@ -227,7 +227,8 @@ impl Renderer {
                 window.focused,
                 window.urgent,
             )?;
-            self.draw_label(ctx, item.cell, &window.name)?;
+            let label = window.program_name();
+            self.draw_label(ctx, item.cell, label.as_ref())?;
             self.draw_border(ctx, item.cell, index == selected)?;
         }
 

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::thread;
 use std::time::Duration;
@@ -26,6 +27,17 @@ pub struct WindowInfo {
     pub urgent: bool,
     pub focused: bool,
     pub geometry: WindowGeometry,
+}
+
+impl WindowInfo {
+    pub fn program_name(&self) -> Cow<'_, str> {
+        self.class
+            .as_deref()
+            .or(self.instance.as_deref())
+            .map(normalize_program_name)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| Cow::Borrowed(self.name.as_str()))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -111,6 +123,62 @@ pub fn print_window_list(windows: &[WindowInfo]) {
             window.name
         );
     }
+}
+
+fn normalize_program_name(value: &str) -> Cow<'_, str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Cow::Borrowed("");
+    }
+
+    match trimmed.to_ascii_lowercase().as_str() {
+        "firefox" => Cow::Borrowed("Firefox"),
+        "google-chrome" | "google_chrome" | "google chrome" => Cow::Borrowed("Google Chrome"),
+        "chromium" => Cow::Borrowed("Chromium"),
+        "alacritty" => Cow::Borrowed("Alacritty"),
+        "slack" => Cow::Borrowed("Slack"),
+        "termius" => Cow::Borrowed("Termius"),
+        "codex" => Cow::Borrowed("Codex"),
+        "kitty" => Cow::Borrowed("Kitty"),
+        "wezterm" | "org.wezfurlong.wezterm" => Cow::Borrowed("WezTerm"),
+        "code" => Cow::Borrowed("Code"),
+        "code-oss" => Cow::Borrowed("Code OSS"),
+        "gnome-terminal" => Cow::Borrowed("GNOME Terminal"),
+        "ghostty" | "com.mitchellh.ghostty" => Cow::Borrowed("Ghostty"),
+        _ if should_title_case(trimmed) => Cow::Owned(title_case_program_name(trimmed)),
+        _ => Cow::Borrowed(trimmed),
+    }
+}
+
+fn should_title_case(value: &str) -> bool {
+    value.contains('-')
+        || value.contains('_')
+        || value
+            .chars()
+            .any(|ch| ch.is_ascii_alphabetic() && ch.is_ascii_lowercase())
+            && value.chars().all(|ch| !ch.is_ascii_uppercase())
+}
+
+fn title_case_program_name(value: &str) -> String {
+    value
+        .replace('-', " ")
+        .replace('_', " ")
+        .split_whitespace()
+        .map(capitalize_ascii)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn capitalize_ascii(word: &str) -> String {
+    let mut chars = word.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+
+    let mut output = String::new();
+    output.extend(first.to_uppercase());
+    output.push_str(chars.as_str());
+    output
 }
 
 pub fn focus_window(
