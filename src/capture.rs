@@ -103,7 +103,7 @@ impl CaptureSweep {
         match capture_window(ctx, window) {
             Ok(image) => {
                 cache.store(window, &image)?;
-                renderer.set_image(task.index, image);
+                renderer.set_image(ctx, task.index, image);
             }
             Err(error) => {
                 if self.debug {

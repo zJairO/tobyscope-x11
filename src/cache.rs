@@ -161,11 +161,6 @@ fn cache_key(window: &WindowInfo) -> String {
     display_key().hash(&mut hasher);
     window.id.hash(&mut hasher);
     window.i3_con_id.hash(&mut hasher);
-    window.workspace.hash(&mut hasher);
-    window.workspace_num.hash(&mut hasher);
-    window.name.hash(&mut hasher);
-    window.class.hash(&mut hasher);
-    window.instance.hash(&mut hasher);
     window.geometry.width.hash(&mut hasher);
     window.geometry.height.hash(&mut hasher);
     format!("{:016x}", hasher.finish())

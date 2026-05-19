@@ -173,7 +173,7 @@ impl OverviewApp {
         Ok(None)
     }
 
-    fn redraw(&self) -> Result<layout::Layout> {
+    fn redraw(&mut self) -> Result<layout::Layout> {
         let (width, height) = self.renderer.size();
         let layout = layout::compute(width, height, &self.windows);
         self.renderer

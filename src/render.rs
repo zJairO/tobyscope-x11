@@ -62,6 +62,13 @@ struct Gcs {
 
 struct ThumbnailSlot {
     state: ThumbnailState,
+    prepared: Option<PreparedImage>,
+}
+
+struct PreparedImage {
+    pixmap: Pixmap,
+    width: u16,
+    height: u16,
 }
 
 enum ThumbnailState {
@@ -100,7 +107,10 @@ impl Renderer {
                     }
                     None => ThumbnailState::Missing,
                 };
-                ThumbnailSlot { state }
+                ThumbnailSlot {
+                    state,
+                    prepared: None,
+                }
             })
             .collect();
 
@@ -139,8 +149,9 @@ impl Renderer {
         }
     }
 
-    pub fn set_image(&mut self, index: usize, image: RgbaImage) {
+    pub fn set_image(&mut self, ctx: &X11Context, index: usize, image: RgbaImage) {
         if let Some(slot) = self.thumbnails.get_mut(index) {
+            slot.release_prepared(ctx);
             slot.state = ThumbnailState::Image(image);
         }
     }
@@ -153,7 +164,7 @@ impl Renderer {
     }
 
     pub fn redraw(
-        &self,
+        &mut self,
         ctx: &X11Context,
         windows: &[WindowInfo],
         layout: &Layout,
@@ -169,12 +180,18 @@ impl Renderer {
             };
             self.fill(ctx, item.cell, cell_gc)?;
 
+            if self
+                .thumbnails
+                .get(index)
+                .and_then(|slot| slot.state.image())
+                .is_some()
+            {
+                self.draw_cached_image(ctx, index, item.preview)?;
+            }
+
             match self.thumbnails.get(index).map(|slot| &slot.state) {
-                Some(ThumbnailState::Image(image)) => {
-                    self.draw_cached_image(ctx, image, item.preview)?;
-                }
-                Some(ThumbnailState::Refreshing(Some(image))) => {
-                    self.draw_cached_image(ctx, image, item.preview)?;
+                Some(ThumbnailState::Image(_)) => {}
+                Some(ThumbnailState::Refreshing(Some(_))) => {
                     self.draw_status(ctx, item.preview, "refreshing", false)?;
                 }
                 Some(ThumbnailState::Refreshing(None)) => {
@@ -185,9 +202,8 @@ impl Renderer {
                 }
                 Some(ThumbnailState::Error {
                     message,
-                    image: Some(image),
+                    image: Some(_),
                 }) => {
-                    self.draw_cached_image(ctx, image, item.preview)?;
                     self.draw_status(ctx, item.preview, "refresh failed", true)?;
                     if item.preview.height > 70 {
                         self.draw_text(ctx, item.preview.x + 8, item.preview.y + 36, message, 72)?;
@@ -235,38 +251,46 @@ impl Renderer {
     }
 
     pub fn cleanup(&mut self, ctx: &X11Context) -> Result<()> {
+        for slot in &mut self.thumbnails {
+            slot.release_prepared(ctx);
+        }
         self.overlay.destroy(ctx)?;
         ctx.conn.flush().context("failed to flush cleanup")?;
         Ok(())
     }
 
-    fn draw_cached_image(&self, ctx: &X11Context, image: &RgbaImage, rect: Rect) -> Result<()> {
+    fn draw_cached_image(&mut self, ctx: &X11Context, index: usize, rect: Rect) -> Result<()> {
         if rect.width == 0 || rect.height == 0 {
             return Ok(());
         }
-        let scaled = image::imageops::resize(
-            image,
-            u32::from(rect.width),
-            u32::from(rect.height),
-            FilterType::Triangle,
-        );
-        let data = pixels::rgba_to_zpixmap(ctx, &scaled)?;
+        let Some(slot) = self.thumbnails.get_mut(index) else {
+            return Ok(());
+        };
+        let Some(pixmap) = slot.ensure_prepared(
+            ctx,
+            self.overlay.window,
+            self.overlay.gcs.image,
+            ctx.root_depth,
+            rect,
+        )?
+        else {
+            return Ok(());
+        };
         ctx.conn
-            .put_image(
-                ImageFormat::Z_PIXMAP,
+            .copy_area(
+                pixmap,
                 self.overlay.buffer,
                 self.overlay.gcs.image,
-                rect.width,
-                rect.height,
+                0,
+                0,
                 rect.x,
                 rect.y,
-                0,
-                ctx.root_depth,
-                &data,
+                rect.width,
+                rect.height,
             )
-            .context("failed to put thumbnail image")?
+            .context("failed to copy prepared thumbnail")?
             .check()
-            .context("X11 rejected thumbnail put_image")?;
+            .context("X11 rejected prepared thumbnail copy")?;
         Ok(())
     }
 
@@ -420,6 +444,76 @@ impl ThumbnailState {
                 image: Some(image), ..
             } => Some(image),
             Self::Refreshing(None) | Self::Missing | Self::Error { image: None, .. } => None,
+        }
+    }
+}
+
+impl ThumbnailSlot {
+    fn ensure_prepared(
+        &mut self,
+        ctx: &X11Context,
+        drawable: Window,
+        gc: Gcontext,
+        depth: u8,
+        rect: Rect,
+    ) -> Result<Option<Pixmap>> {
+        if self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.width == rect.width && prepared.height == rect.height)
+        {
+            return Ok(self.prepared.as_ref().map(|prepared| prepared.pixmap));
+        }
+
+        let Some((pixmap, width, height)) = (|| -> Result<Option<(Pixmap, u16, u16)>> {
+            let Some(image) = self.state.image() else {
+                return Ok(None);
+            };
+            let scaled = image::imageops::resize(
+                image,
+                u32::from(rect.width),
+                u32::from(rect.height),
+                FilterType::Triangle,
+            );
+            let data = pixels::rgba_to_zpixmap(ctx, &scaled)?;
+            let pixmap = create_buffer(ctx, drawable, rect.width, rect.height)?;
+            ctx.conn
+                .put_image(
+                    ImageFormat::Z_PIXMAP,
+                    pixmap,
+                    gc,
+                    rect.width,
+                    rect.height,
+                    0,
+                    0,
+                    0,
+                    depth,
+                    &data,
+                )
+                .context("failed to upload prepared thumbnail")?
+                .check()
+                .context("X11 rejected prepared thumbnail upload")?;
+            Ok(Some((pixmap, rect.width, rect.height)))
+        })()?
+        else {
+            self.release_prepared(ctx);
+            return Ok(None);
+        };
+
+        self.release_prepared(ctx);
+        self.prepared = Some(PreparedImage {
+            pixmap,
+            width,
+            height,
+        });
+        Ok(Some(pixmap))
+    }
+
+    fn release_prepared(&mut self, ctx: &X11Context) {
+        if let Some(prepared) = self.prepared.take() {
+            if let Ok(cookie) = ctx.conn.free_pixmap(prepared.pixmap) {
+                cookie.ignore_error();
+            }
         }
     }
 }
