@@ -3,6 +3,7 @@ mod atoms;
 mod cache;
 mod capture;
 mod cli;
+mod config;
 mod i3;
 mod input;
 mod layout;
@@ -15,6 +16,7 @@ use anyhow::Result;
 
 fn main() -> Result<()> {
     let args = cli::Args::parse()?;
+    let config = config::load(args.config_path.as_deref(), args.debug)?.config;
     let ctx = x11::X11Context::connect(args.debug)?;
     ctx.require_extensions(args.debug)?;
     let atoms = atoms::Atoms::intern(&ctx.conn)?;
@@ -30,5 +32,5 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    app::OverviewApp::new(ctx, atoms, windows, args.debug)?.run()
+    app::OverviewApp::new(ctx, atoms, windows, config, args.debug)?.run()
 }

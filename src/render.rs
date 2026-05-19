@@ -14,25 +14,18 @@ use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::{CURRENT_TIME, NONE};
 
 use crate::cache::ThumbnailCache;
+use crate::config::{AppConfig, ColorConfig};
 use crate::layout::{Layout, Rect};
 use crate::pixels;
 use crate::windows::WindowInfo;
 use crate::x11::X11Context;
 
-const COLOR_BACKGROUND: u32 = 0x101418;
-const COLOR_CELL: u32 = 0x202832;
-const COLOR_CELL_HOVER: u32 = 0x2b3642;
-const COLOR_BORDER: u32 = 0x5f6f7f;
-const COLOR_SELECTED: u32 = 0x4ea1ff;
-const COLOR_TEXT: u32 = 0xe8edf2;
-const COLOR_MUTED: u32 = 0x95a3b2;
-const COLOR_ERROR: u32 = 0x66303a;
-const COLOR_EMPTY: u32 = 0x151b21;
 const APP_ID: &str = "tobyscope-x11";
 
 pub struct Renderer {
     overlay: Overlay,
     thumbnails: Vec<ThumbnailSlot>,
+    config: AppConfig,
 }
 
 struct Overlay {
@@ -54,6 +47,7 @@ struct Gcs {
     muted: Gcontext,
     error: Gcontext,
     empty: Gcontext,
+    shadow: Gcontext,
     image: Gcontext,
     font: Font,
 }
@@ -84,6 +78,7 @@ impl Renderer {
         ctx: &X11Context,
         windows: &[WindowInfo],
         cache: &ThumbnailCache,
+        config: &AppConfig,
         debug: bool,
     ) -> Result<Self> {
         let formats = ctx
@@ -92,7 +87,7 @@ impl Renderer {
             .context("failed to request XRender pict formats")?
             .reply()
             .context("failed to read XRender pict formats")?;
-        let overlay = Overlay::create(ctx, &formats)?;
+        let overlay = Overlay::create(ctx, &formats, config)?;
         let thumbnails = windows
             .iter()
             .map(|window| {
@@ -115,6 +110,7 @@ impl Renderer {
         Ok(Self {
             overlay,
             thumbnails,
+            config: config.clone(),
         })
     }
 
@@ -168,7 +164,9 @@ impl Renderer {
         layout: &Layout,
         selected: usize,
     ) -> Result<()> {
-        self.fill(ctx, self.overlay.rect(), self.overlay.gcs.bg)?;
+        if self.config.ui.show_overlay_background {
+            self.fill(ctx, self.overlay.rect(), self.overlay.gcs.bg)?;
+        }
 
         for (index, (window, item)) in windows.iter().zip(&layout.items).enumerate() {
             let cell_gc = if index == selected {
@@ -176,7 +174,8 @@ impl Renderer {
             } else {
                 self.overlay.gcs.cell
             };
-            self.fill(ctx, item.cell, cell_gc)?;
+            self.draw_card_shadow(ctx, item.cell)?;
+            self.draw_cell_background(ctx, item.cell, cell_gc, index == selected)?;
 
             if self
                 .thumbnails
@@ -184,7 +183,7 @@ impl Renderer {
                 .and_then(|slot| slot.state.image())
                 .is_some()
             {
-                self.draw_cached_image(ctx, index, item.preview)?;
+                self.draw_cached_image(ctx, index, item.preview, cell_gc)?;
             }
 
             match self.thumbnails.get(index).map(|slot| &slot.state) {
@@ -227,24 +226,32 @@ impl Renderer {
             )?;
             let label = window.program_name();
             self.draw_label(ctx, item.cell, label.as_ref())?;
-            self.draw_border(ctx, item.cell, index == selected)?;
+            if !self.config.ui.rounded_corners {
+                self.draw_border(ctx, item.cell, index == selected)?;
+            }
         }
 
-        ctx.conn
-            .copy_area(
-                self.overlay.buffer,
-                self.overlay.window,
-                self.overlay.gcs.image,
-                0,
-                0,
-                0,
-                0,
-                self.overlay.width,
-                self.overlay.height,
-            )
-            .context("failed to copy back buffer to overlay")?
-            .check()
-            .context("X11 rejected overlay back-buffer copy")?;
+        if self.config.ui.show_overlay_background {
+            ctx.conn
+                .copy_area(
+                    self.overlay.buffer,
+                    self.overlay.window,
+                    self.overlay.gcs.image,
+                    0,
+                    0,
+                    0,
+                    0,
+                    self.overlay.width,
+                    self.overlay.height,
+                )
+                .context("failed to copy back buffer to overlay")?
+                .check()
+                .context("X11 rejected overlay back-buffer copy")?;
+        } else {
+            for item in &layout.items {
+                self.copy_card_to_overlay(ctx, self.card_paint_bounds(item.cell))?;
+            }
+        }
         ctx.conn.flush().context("failed to flush redraw")?;
         Ok(())
     }
@@ -258,7 +265,13 @@ impl Renderer {
         Ok(())
     }
 
-    fn draw_cached_image(&mut self, ctx: &X11Context, index: usize, rect: Rect) -> Result<()> {
+    fn draw_cached_image(
+        &mut self,
+        ctx: &X11Context,
+        index: usize,
+        rect: Rect,
+        corner_gc: Gcontext,
+    ) -> Result<()> {
         if rect.width == 0 || rect.height == 0 {
             return Ok(());
         }
@@ -299,21 +312,129 @@ impl Renderer {
             .context("failed to copy prepared thumbnail")?
             .check()
             .context("X11 rejected prepared thumbnail copy")?;
+        if self.config.ui.rounded_corners {
+            self.cover_rounded_corners(ctx, target, self.config.ui.corner_radius, corner_gc)?;
+        }
         Ok(())
     }
 
+    fn copy_card_to_overlay(&self, ctx: &X11Context, rect: Rect) -> Result<()> {
+        let spans = if self.config.ui.rounded_corners {
+            rounded_rect_spans(rect, rounded_radius(rect, self.config.ui.corner_radius))
+        } else {
+            vec![Rectangle {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            }]
+        };
+
+        for span in spans {
+            ctx.conn
+                .copy_area(
+                    self.overlay.buffer,
+                    self.overlay.window,
+                    self.overlay.gcs.image,
+                    span.x,
+                    span.y,
+                    span.x,
+                    span.y,
+                    span.width,
+                    span.height,
+                )
+                .context("failed to copy card buffer to overlay")?
+                .check()
+                .context("X11 rejected card buffer copy")?;
+        }
+        Ok(())
+    }
+
+    fn card_paint_bounds(&self, rect: Rect) -> Rect {
+        if !self.config.ui.shadows {
+            return rect;
+        }
+
+        union_rect(
+            rect,
+            offset_rect(
+                rect,
+                self.config.ui.shadow_offset_x,
+                self.config.ui.shadow_offset_y,
+            ),
+            self.overlay.width,
+            self.overlay.height,
+        )
+    }
+
     fn draw_status_box(&self, ctx: &X11Context, rect: Rect, message: &str) -> Result<()> {
-        self.fill(ctx, rect, self.overlay.gcs.empty)?;
+        self.fill_preview(ctx, rect, self.overlay.gcs.empty)?;
         self.draw_status(ctx, rect, message, false)
     }
 
     fn draw_error_box(&self, ctx: &X11Context, rect: Rect, message: &str) -> Result<()> {
-        self.fill(ctx, rect, self.overlay.gcs.error)?;
+        self.fill_preview(ctx, rect, self.overlay.gcs.error)?;
         self.draw_status(ctx, rect, "preview error", true)?;
         if rect.height > 48 {
             self.draw_text(ctx, rect.x + 8, rect.y + 38, message, 72)?;
         }
         Ok(())
+    }
+
+    fn draw_card_shadow(&self, ctx: &X11Context, rect: Rect) -> Result<()> {
+        if !self.config.ui.shadows {
+            return Ok(());
+        }
+
+        let shadow = offset_rect(
+            rect,
+            self.config.ui.shadow_offset_x,
+            self.config.ui.shadow_offset_y,
+        );
+        let radius = if self.config.ui.rounded_corners {
+            self.config
+                .ui
+                .shadow_radius
+                .max(self.config.ui.corner_radius)
+        } else {
+            self.config.ui.shadow_radius
+        };
+        self.fill_rounded(ctx, shadow, radius, self.overlay.gcs.shadow)
+    }
+
+    fn draw_cell_background(
+        &self,
+        ctx: &X11Context,
+        rect: Rect,
+        cell_gc: Gcontext,
+        selected: bool,
+    ) -> Result<()> {
+        if !self.config.ui.rounded_corners {
+            return self.fill(ctx, rect, cell_gc);
+        }
+
+        let thickness = border_thickness(selected);
+        let border_gc = if selected {
+            self.overlay.gcs.selected
+        } else {
+            self.overlay.gcs.border
+        };
+        let radius = rounded_radius(rect, self.config.ui.corner_radius);
+        self.fill_rounded(ctx, rect, radius, border_gc)?;
+
+        let inner = inset_rect(rect, thickness);
+        if inner.width > 0 && inner.height > 0 {
+            self.fill_rounded(ctx, inner, radius.saturating_sub(thickness), cell_gc)?;
+        }
+        Ok(())
+    }
+
+    fn fill_preview(&self, ctx: &X11Context, rect: Rect, gc: Gcontext) -> Result<()> {
+        if self.config.ui.rounded_corners {
+            self.fill_rounded(ctx, rect, self.config.ui.corner_radius, gc)
+        } else {
+            self.fill(ctx, rect, gc)
+        }
     }
 
     fn draw_status(&self, ctx: &X11Context, rect: Rect, message: &str, error: bool) -> Result<()> {
@@ -333,6 +454,9 @@ impl Renderer {
         focused: bool,
         urgent: bool,
     ) -> Result<()> {
+        if !self.config.ui.show_workspace_number {
+            return Ok(());
+        }
         let width = cell.width.saturating_sub(18).min(136);
         let rect = Rect {
             x: cell.x + 9,
@@ -352,6 +476,9 @@ impl Renderer {
     }
 
     fn draw_label(&self, ctx: &X11Context, cell: Rect, label: &str) -> Result<()> {
+        if !self.config.ui.show_program_name {
+            return Ok(());
+        }
         let y = cell.y.saturating_add(cell.height as i16).saturating_sub(12);
         let max_chars = (usize::from(cell.width) / 7)
             .saturating_sub(2)
@@ -360,7 +487,7 @@ impl Renderer {
     }
 
     fn draw_border(&self, ctx: &X11Context, rect: Rect, selected: bool) -> Result<()> {
-        let thickness = if selected { 4 } else { 2 };
+        let thickness = border_thickness(selected);
         let gc = if selected {
             self.overlay.gcs.selected
         } else {
@@ -416,6 +543,41 @@ impl Renderer {
                 }],
             )
             .context("failed to fill rectangle")?;
+        Ok(())
+    }
+
+    fn fill_rounded(&self, ctx: &X11Context, rect: Rect, radius: u16, gc: Gcontext) -> Result<()> {
+        let radius = rounded_radius(rect, radius);
+        if radius == 0 {
+            return self.fill(ctx, rect, gc);
+        }
+
+        let rectangles = rounded_rect_spans(rect, radius);
+        ctx.conn
+            .poly_fill_rectangle(self.overlay.buffer, gc, &rectangles)
+            .context("failed to fill rounded rectangle")?;
+        Ok(())
+    }
+
+    fn cover_rounded_corners(
+        &self,
+        ctx: &X11Context,
+        rect: Rect,
+        radius: u16,
+        gc: Gcontext,
+    ) -> Result<()> {
+        let radius = rounded_radius(rect, radius);
+        if radius == 0 {
+            return Ok(());
+        }
+
+        let rectangles = rounded_corner_cutouts(rect, radius);
+        if rectangles.is_empty() {
+            return Ok(());
+        }
+        ctx.conn
+            .poly_fill_rectangle(self.overlay.buffer, gc, &rectangles)
+            .context("failed to cover rounded thumbnail corners")?;
         Ok(())
     }
 
@@ -552,7 +714,11 @@ impl ThumbnailSlot {
 }
 
 impl Overlay {
-    fn create(ctx: &X11Context, formats: &QueryPictFormatsReply) -> Result<Self> {
+    fn create(
+        ctx: &X11Context,
+        formats: &QueryPictFormatsReply,
+        config: &AppConfig,
+    ) -> Result<Self> {
         let pict_format = pict_format_for_visual(formats, ctx.root_visual).with_context(|| {
             format!(
                 "no XRender pict format for root visual 0x{:08x}",
@@ -563,9 +729,8 @@ impl Overlay {
             .conn
             .generate_id()
             .context("failed to allocate overlay window id")?;
-        let values = CreateWindowAux::new()
-            .background_pixel(COLOR_BACKGROUND)
-            .border_pixel(COLOR_BACKGROUND)
+        let mut values = CreateWindowAux::new()
+            .border_pixel(config.colors.background)
             .override_redirect(1u32)
             .event_mask(
                 EventMask::EXPOSURE
@@ -574,6 +739,11 @@ impl Overlay {
                     | EventMask::POINTER_MOTION
                     | EventMask::STRUCTURE_NOTIFY,
             );
+        values = if config.ui.show_overlay_background {
+            values.background_pixel(config.colors.background)
+        } else {
+            values.background_pixmap(NONE)
+        };
 
         ctx.conn
             .create_window(
@@ -605,7 +775,7 @@ impl Overlay {
             .context("XRender rejected overlay picture")?;
 
         let buffer = create_buffer(ctx, window, ctx.width, ctx.height)?;
-        let gcs = Gcs::create(ctx, buffer)?;
+        let gcs = Gcs::create(ctx, buffer, &config.colors, &config.ui.font)?;
 
         ctx.conn
             .map_window(window)
@@ -711,28 +881,34 @@ impl Overlay {
 }
 
 impl Gcs {
-    fn create(ctx: &X11Context, drawable: Pixmap) -> Result<Self> {
+    fn create(
+        ctx: &X11Context,
+        drawable: Pixmap,
+        colors: &ColorConfig,
+        font_name: &str,
+    ) -> Result<Self> {
         let font = ctx
             .conn
             .generate_id()
             .context("failed to allocate font id")?;
         ctx.conn
-            .open_font(font, b"fixed")
-            .context("failed to open X11 fixed font")?
+            .open_font(font, font_name.as_bytes())
+            .with_context(|| format!("failed to open X11 font `{font_name}`"))?
             .check()
-            .context("X11 rejected fixed font")?;
+            .with_context(|| format!("X11 rejected font `{font_name}`"))?;
 
         Ok(Self {
-            bg: create_gc(ctx, drawable, COLOR_BACKGROUND, COLOR_BACKGROUND, font)?,
-            cell: create_gc(ctx, drawable, COLOR_CELL, COLOR_CELL, font)?,
-            cell_hover: create_gc(ctx, drawable, COLOR_CELL_HOVER, COLOR_CELL_HOVER, font)?,
-            border: create_gc(ctx, drawable, COLOR_BORDER, COLOR_BORDER, font)?,
-            selected: create_gc(ctx, drawable, COLOR_SELECTED, COLOR_SELECTED, font)?,
-            text: create_gc(ctx, drawable, COLOR_TEXT, COLOR_BACKGROUND, font)?,
-            muted: create_gc(ctx, drawable, COLOR_MUTED, COLOR_BACKGROUND, font)?,
-            error: create_gc(ctx, drawable, COLOR_ERROR, COLOR_ERROR, font)?,
-            empty: create_gc(ctx, drawable, COLOR_EMPTY, COLOR_EMPTY, font)?,
-            image: create_gc(ctx, drawable, COLOR_TEXT, COLOR_BACKGROUND, font)?,
+            bg: create_gc(ctx, drawable, colors.background, colors.background, font)?,
+            cell: create_gc(ctx, drawable, colors.cell, colors.cell, font)?,
+            cell_hover: create_gc(ctx, drawable, colors.cell_hover, colors.cell_hover, font)?,
+            border: create_gc(ctx, drawable, colors.border, colors.border, font)?,
+            selected: create_gc(ctx, drawable, colors.selected, colors.selected, font)?,
+            text: create_gc(ctx, drawable, colors.text, colors.background, font)?,
+            muted: create_gc(ctx, drawable, colors.muted, colors.background, font)?,
+            error: create_gc(ctx, drawable, colors.error, colors.error, font)?,
+            empty: create_gc(ctx, drawable, colors.empty, colors.empty, font)?,
+            shadow: create_gc(ctx, drawable, colors.shadow, colors.background, font)?,
+            image: create_gc(ctx, drawable, colors.text, colors.background, font)?,
             font,
         })
     }
@@ -748,6 +924,7 @@ impl Gcs {
             self.muted,
             self.error,
             self.empty,
+            self.shadow,
             self.image,
         ] {
             if let Ok(cookie) = ctx.conn.free_gc(gc) {
@@ -904,4 +1081,171 @@ fn fit_image(area: Rect, source_width: u32, source_height: u32) -> Rect {
 
 fn rounded_div(value: u64, divisor: u64) -> u32 {
     ((value + divisor / 2) / divisor) as u32
+}
+
+fn border_thickness(selected: bool) -> u16 {
+    if selected { 4 } else { 2 }
+}
+
+fn inset_rect(rect: Rect, amount: u16) -> Rect {
+    let inset_x = amount.min(rect.width / 2);
+    let inset_y = amount.min(rect.height / 2);
+    Rect {
+        x: rect.x + inset_x as i16,
+        y: rect.y + inset_y as i16,
+        width: rect.width.saturating_sub(inset_x.saturating_mul(2)),
+        height: rect.height.saturating_sub(inset_y.saturating_mul(2)),
+    }
+}
+
+fn offset_rect(rect: Rect, offset_x: i16, offset_y: i16) -> Rect {
+    Rect {
+        x: rect.x.saturating_add(offset_x),
+        y: rect.y.saturating_add(offset_y),
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
+fn union_rect(a: Rect, b: Rect, max_width: u16, max_height: u16) -> Rect {
+    let left = a.x.min(b.x).max(0);
+    let top = a.y.min(b.y).max(0);
+    let right = rect_right(a).max(rect_right(b)).min(i32::from(max_width));
+    let bottom = rect_bottom(a)
+        .max(rect_bottom(b))
+        .min(i32::from(max_height));
+    Rect {
+        x: left,
+        y: top,
+        width: (right - i32::from(left)).max(0) as u16,
+        height: (bottom - i32::from(top)).max(0) as u16,
+    }
+}
+
+fn rect_right(rect: Rect) -> i32 {
+    i32::from(rect.x) + i32::from(rect.width)
+}
+
+fn rect_bottom(rect: Rect) -> i32 {
+    i32::from(rect.y) + i32::from(rect.height)
+}
+
+fn rounded_radius(rect: Rect, radius: u16) -> u16 {
+    radius.min(rect.width / 2).min(rect.height / 2)
+}
+
+fn rounded_rect_spans(rect: Rect, radius: u16) -> Vec<Rectangle> {
+    if radius == 0 {
+        return vec![Rectangle {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        }];
+    }
+
+    let mut spans = Vec::with_capacity(rect.height as usize);
+    for row in 0..rect.height {
+        let offset = rounded_row_offset(radius, row, rect.height);
+        let width = rect.width.saturating_sub(offset.saturating_mul(2));
+        if width == 0 {
+            continue;
+        }
+        push_span(
+            &mut spans,
+            Rectangle {
+                x: rect.x + offset as i16,
+                y: rect.y + row as i16,
+                width,
+                height: 1,
+            },
+        );
+    }
+    spans
+}
+
+fn rounded_corner_cutouts(rect: Rect, radius: u16) -> Vec<Rectangle> {
+    let mut cutouts = Vec::new();
+    for row in 0..radius {
+        let offset = corner_offset(radius, row);
+        if offset == 0 {
+            continue;
+        }
+
+        let top_y = rect.y + row as i16;
+        push_span(
+            &mut cutouts,
+            Rectangle {
+                x: rect.x,
+                y: top_y,
+                width: offset,
+                height: 1,
+            },
+        );
+        push_span(
+            &mut cutouts,
+            Rectangle {
+                x: rect.x + rect.width as i16 - offset as i16,
+                y: top_y,
+                width: offset,
+                height: 1,
+            },
+        );
+
+        let bottom_y = rect.y + rect.height as i16 - row as i16 - 1;
+        if bottom_y != top_y {
+            push_span(
+                &mut cutouts,
+                Rectangle {
+                    x: rect.x,
+                    y: bottom_y,
+                    width: offset,
+                    height: 1,
+                },
+            );
+            push_span(
+                &mut cutouts,
+                Rectangle {
+                    x: rect.x + rect.width as i16 - offset as i16,
+                    y: bottom_y,
+                    width: offset,
+                    height: 1,
+                },
+            );
+        }
+    }
+    cutouts
+}
+
+fn rounded_row_offset(radius: u16, row: u16, height: u16) -> u16 {
+    if row < radius {
+        corner_offset(radius, row)
+    } else if row >= height.saturating_sub(radius) {
+        corner_offset(radius, height.saturating_sub(row).saturating_sub(1))
+    } else {
+        0
+    }
+}
+
+fn corner_offset(radius: u16, row_from_edge: u16) -> u16 {
+    let radius = i32::from(radius);
+    let y = radius - 1 - i32::from(row_from_edge);
+    let inside = integer_sqrt((radius * radius - y * y) as u32) as i32;
+    (radius - inside).max(0) as u16
+}
+
+fn integer_sqrt(value: u32) -> u32 {
+    (value as f64).sqrt().floor() as u32
+}
+
+fn push_span(spans: &mut Vec<Rectangle>, next: Rectangle) {
+    if let Some(previous) = spans.last_mut()
+        && previous.x == next.x
+        && previous.width == next.width
+        && previous.y.saturating_add(previous.height as i16) == next.y
+    {
+        previous.height = previous.height.saturating_add(next.height);
+        return;
+    }
+    spans.push(next);
 }

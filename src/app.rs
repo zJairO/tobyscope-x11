@@ -6,6 +6,7 @@ use x11rb::protocol::xproto::ButtonIndex;
 use crate::atoms::Atoms;
 use crate::cache::ThumbnailCache;
 use crate::capture::{CaptureSweep, SweepStatus};
+use crate::config::AppConfig;
 use crate::input::{KeyAction, KeyMap};
 use crate::layout::{self, Layout};
 use crate::render::Renderer;
@@ -16,6 +17,7 @@ pub struct OverviewApp {
     ctx: X11Context,
     atoms: Atoms,
     windows: Vec<WindowInfo>,
+    config: AppConfig,
     cache: ThumbnailCache,
     renderer: Renderer,
     keymap: KeyMap,
@@ -28,16 +30,22 @@ impl OverviewApp {
         ctx: X11Context,
         atoms: Atoms,
         windows: Vec<WindowInfo>,
+        config: AppConfig,
         debug: bool,
     ) -> Result<Self> {
-        let cache = ThumbnailCache::new(&windows, debug)?;
+        let cache = ThumbnailCache::new(
+            &windows,
+            std::time::Duration::from_secs(config.thumbnails.refresh_after_seconds),
+            debug,
+        )?;
         cache.prune()?;
-        let renderer = Renderer::new(&ctx, &windows, &cache, debug)?;
+        let renderer = Renderer::new(&ctx, &windows, &cache, &config, debug)?;
         let keymap = KeyMap::load(&ctx)?;
         Ok(Self {
             ctx,
             atoms,
             windows,
+            config,
             cache,
             renderer,
             keymap,
@@ -67,7 +75,12 @@ impl OverviewApp {
     }
 
     fn event_loop(&mut self) -> Result<Option<WindowInfo>> {
-        let mut sweep = Some(CaptureSweep::new(&self.windows, &self.cache, self.debug));
+        let mut sweep = Some(CaptureSweep::new(
+            &self.windows,
+            &self.cache,
+            self.config.thumbnails.max_cache_edge,
+            self.debug,
+        ));
         let mut layout = self.redraw()?;
 
         loop {
@@ -203,7 +216,7 @@ impl OverviewApp {
 
     fn redraw(&mut self) -> Result<layout::Layout> {
         let (width, height) = self.renderer.size();
-        let layout = layout::compute(width, height, &self.windows);
+        let layout = layout::compute(width, height, &self.windows, &self.config);
         self.renderer
             .redraw(&self.ctx, &self.windows, &layout, self.selected)?;
         Ok(layout)

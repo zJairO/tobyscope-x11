@@ -19,7 +19,6 @@ use crate::x11::X11Context;
 const VIEWABLE_TIMEOUT: Duration = Duration::from_millis(1200);
 const VIEWABLE_POLL: Duration = Duration::from_millis(35);
 const WORKSPACE_SETTLE: Duration = Duration::from_millis(90);
-const MAX_CACHE_EDGE: u32 = 960;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepStatus {
@@ -38,11 +37,17 @@ pub struct CaptureSweep {
     original_workspace: Option<String>,
     active_workspace: Option<String>,
     restored: bool,
+    max_cache_edge: u32,
     debug: bool,
 }
 
 impl CaptureSweep {
-    pub fn new(windows: &[WindowInfo], cache: &ThumbnailCache, debug: bool) -> Self {
+    pub fn new(
+        windows: &[WindowInfo],
+        cache: &ThumbnailCache,
+        max_cache_edge: u32,
+        debug: bool,
+    ) -> Self {
         let original_workspace = match i3::current_workspace() {
             Ok(workspace) => workspace,
             Err(error) => {
@@ -70,6 +75,7 @@ impl CaptureSweep {
             original_workspace,
             active_workspace: None,
             restored: false,
+            max_cache_edge,
             debug,
         }
     }
@@ -100,7 +106,7 @@ impl CaptureSweep {
             return Ok(SweepStatus::Updated);
         };
         renderer.set_refreshing(task.index);
-        match capture_window(ctx, window) {
+        match capture_window(ctx, window, self.max_cache_edge) {
             Ok(image) => {
                 cache.store(window, &image)?;
                 renderer.set_image(ctx, task.index, image);
@@ -142,7 +148,11 @@ impl CaptureSweep {
     }
 }
 
-pub fn capture_window(ctx: &X11Context, window: &WindowInfo) -> Result<RgbaImage> {
+pub fn capture_window(
+    ctx: &X11Context,
+    window: &WindowInfo,
+    max_cache_edge: u32,
+) -> Result<RgbaImage> {
     wait_for_viewable(ctx, window)?;
     let geometry = i3::refresh_geometry(ctx, window)?;
     if geometry.width == 0 || geometry.height == 0 {
@@ -197,7 +207,7 @@ pub fn capture_window(ctx: &X11Context, window: &WindowInfo) -> Result<RgbaImage
             geometry.height,
             &image.data,
         )?;
-        Ok(scale_for_cache(&rgba))
+        Ok(scale_for_cache(&rgba, max_cache_edge))
     })();
 
     if let Some(pixmap_id) = pixmap {
@@ -236,12 +246,13 @@ fn wait_for_viewable(ctx: &X11Context, window: &WindowInfo) -> Result<()> {
     }
 }
 
-fn scale_for_cache(image: &RgbaImage) -> RgbaImage {
+fn scale_for_cache(image: &RgbaImage, max_cache_edge: u32) -> RgbaImage {
+    let max_cache_edge = max_cache_edge.max(1);
     let max_edge = image.width().max(image.height());
-    if max_edge <= MAX_CACHE_EDGE {
+    if max_edge <= max_cache_edge {
         return image.clone();
     }
-    let scale = MAX_CACHE_EDGE as f32 / max_edge as f32;
+    let scale = max_cache_edge as f32 / max_edge as f32;
     let width = ((image.width() as f32 * scale).round() as u32).max(1);
     let height = ((image.height() as f32 * scale).round() as u32).max(1);
     image::imageops::resize(image, width, height, FilterType::Triangle)

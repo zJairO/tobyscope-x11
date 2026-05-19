@@ -1,0 +1,35 @@
+[ui]
+font = "fixed"
+show_overlay_background = true
+show_workspace_number = true
+show_program_name = true
+rounded_corners = false
+corner_radius = 14
+shadows = false
+shadow_offset_x = 0
+shadow_offset_y = 8
+shadow_radius = 18
+
+[colors]
+background = "#101418"
+cell = "#202832"
+cell_hover = "#2b3642"
+border = "#5f6f7f"
+selected = "#4ea1ff"
+text = "#e8edf2"
+muted = "#95a3b2"
+error = "#66303a"
+empty = "#151b21"
+shadow = "#05080c"
+
+[layout]
+margin = 24
+gap_small = 12
+gap = 18
+padding = 12
+top_meta_height = 40
+label_height = 34
+
+[thumbnails]
+refresh_after_seconds = 600
+max_cache_edge = 960

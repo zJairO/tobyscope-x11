@@ -10,12 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::windows::WindowInfo;
 
-const FRESH_THUMBNAIL_FOR: Duration = Duration::from_secs(10 * 60);
-
 #[derive(Debug)]
 pub struct ThumbnailCache {
     dir: PathBuf,
     valid_keys: HashSet<String>,
+    refresh_after: Duration,
     debug: bool,
 }
 
@@ -33,7 +32,7 @@ struct ThumbnailMetadata {
 }
 
 impl ThumbnailCache {
-    pub fn new(windows: &[WindowInfo], debug: bool) -> Result<Self> {
+    pub fn new(windows: &[WindowInfo], refresh_after: Duration, debug: bool) -> Result<Self> {
         let display = display_key();
         let dir = dirs_next::cache_dir()
             .unwrap_or_else(std::env::temp_dir)
@@ -50,6 +49,7 @@ impl ThumbnailCache {
         Ok(Self {
             dir,
             valid_keys,
+            refresh_after,
             debug,
         })
     }
@@ -80,7 +80,7 @@ impl ThumbnailCache {
             return true;
         };
         match modified.elapsed() {
-            Ok(age) => age > FRESH_THUMBNAIL_FOR,
+            Ok(age) => age > self.refresh_after,
             Err(_) => false,
         }
     }

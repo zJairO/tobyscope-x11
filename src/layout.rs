@@ -1,3 +1,4 @@
+use crate::config::AppConfig;
 use crate::windows::WindowInfo;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -28,13 +29,34 @@ pub struct Layout {
     pub items: Vec<LayoutItem>,
 }
 
-pub fn compute(screen_width: u16, screen_height: u16, windows: &[WindowInfo]) -> Layout {
+pub fn compute(
+    screen_width: u16,
+    screen_height: u16,
+    windows: &[WindowInfo],
+    config: &AppConfig,
+) -> Layout {
     let count = windows.len().max(1);
-    let margin = 24u16.min(screen_width / 10).min(screen_height / 10);
-    let gap = if count <= 3 { 12u16 } else { 18u16 };
-    let top_meta_height = 40u16;
-    let label_height = 34u16;
-    let padding = 12u16;
+    let margin = config
+        .layout
+        .margin
+        .min(screen_width / 2)
+        .min(screen_height / 2);
+    let gap = if count <= 3 {
+        config.layout.gap_small
+    } else {
+        config.layout.gap
+    };
+    let top_meta_height = if config.ui.show_workspace_number {
+        config.layout.top_meta_height
+    } else {
+        config.layout.padding
+    };
+    let label_height = if config.ui.show_program_name {
+        config.layout.label_height
+    } else {
+        0
+    };
+    let padding = config.layout.padding;
     let (columns, rows) = choose_grid(count, screen_width, screen_height);
 
     let total_gap_x = gap.saturating_mul(columns.saturating_sub(1) as u16);
