@@ -14,7 +14,7 @@ The repository and release must be public for these URLs to work without GitHub
 permissions.
 
 ```bash
-version=v0.1.0
+version=v0.1.1
 curl -LO "https://github.com/zJairO/tobyscope-x11/releases/download/${version}/tobyscope-x11-linux-x86_64.tar.gz"
 curl -LO "https://github.com/zJairO/tobyscope-x11/releases/download/${version}/SHA256SUMS"
 sha256sum -c SHA256SUMS
@@ -43,7 +43,7 @@ your system Rust is current.
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential pkg-config libx11-dev libxcomposite-dev libxrender-dev libxdamage-dev libxfixes-dev curl
+sudo apt install -y build-essential pkg-config libx11-dev libxcomposite-dev libxrender-dev libxdamage-dev libxfixes-dev libcairo2-dev libpango1.0-dev curl
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
 cargo build --release --locked
@@ -120,7 +120,7 @@ Example:
 
 ```toml
 [ui]
-font = "fixed"
+font = "Iosevka Term 11"
 show_overlay_background = true
 show_workspace_number = true
 show_program_name = true
@@ -158,7 +158,8 @@ max_cache_edge = 960
 
 Notes:
 
-- `font` is an X11 core font name, for example `fixed` or `9x15`.
+- `font` is a Pango/Fontconfig description, for example `Iosevka Term 11`.
+  Polybar-style values such as `Iosevka Term:size=11;2` are accepted too.
 - Colors must be `#RRGGBB`.
 - Partial configs are allowed; missing values use built-in defaults.
 - `show_overlay_background = false` avoids painting the dark fullscreen
@@ -201,14 +202,14 @@ lists.
 
 ## Release Maintainers
 
-To publish `v0.1.0`:
+To publish a release:
 
 ```bash
 git status --short
 cargo check
 cargo build --release --locked
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 The GitHub Actions release workflow builds the Linux x86_64 tarball, creates

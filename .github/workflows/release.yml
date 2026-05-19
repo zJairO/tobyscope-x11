@@ -29,7 +29,9 @@ jobs:
             libxcomposite-dev \
             libxrender-dev \
             libxdamage-dev \
-            libxfixes-dev
+            libxfixes-dev \
+            libcairo2-dev \
+            libpango1.0-dev
 
       - name: Build release binary
         run: cargo build --release --locked

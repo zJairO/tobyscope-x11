@@ -1,5 +1,5 @@
 [ui]
-font = "fixed"
+font = "Iosevka Term 11"
 show_overlay_background = true
 show_workspace_number = true
 show_program_name = true

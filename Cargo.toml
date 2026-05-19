@@ -1,13 +1,16 @@
 [package]
 name = "tobyscope-x11"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+cairo-rs = "0.21"
 dirs-next = "2.0"
 i3ipc = "0.10.1"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+pango = "0.21"
+pangocairo = "0.21"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"

@@ -1,6 +1,11 @@
-use anyhow::{Context, Result, bail};
-use image::RgbaImage;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use anyhow::{Context, Result, anyhow, bail};
+use cairo::{Context as CairoContext, Format, ImageSurface};
 use image::imageops::FilterType;
+use image::{Rgba, RgbaImage};
+use pango::FontDescription;
 use x11rb::connection::Connection;
 use x11rb::protocol::render::{
     ConnectionExt as RenderConnectionExt, CreatePictureAux, Pictformat, Picture,
@@ -25,6 +30,9 @@ const APP_ID: &str = "tobyscope-x11";
 pub struct Renderer {
     overlay: Overlay,
     thumbnails: Vec<ThumbnailSlot>,
+    panel_cache: HashMap<PanelKey, Pixmap>,
+    shadow_cache: HashMap<ShadowKey, Pixmap>,
+    text: TextRenderer,
     config: AppConfig,
 }
 
@@ -61,6 +69,49 @@ struct PreparedImage {
     pixmap: Pixmap,
     width: u16,
     height: u16,
+    corner_background: Option<u32>,
+    corner_radius: u16,
+}
+
+struct TextRenderer {
+    font: String,
+    cache: RefCell<HashMap<TextKey, TextPixmap>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextPixmap {
+    pixmap: Pixmap,
+    width: u16,
+    height: u16,
+    baseline: i16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PanelKey {
+    width: u16,
+    height: u16,
+    radius: u16,
+    thickness: u16,
+    background: u32,
+    border: u32,
+    fill: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ShadowKey {
+    width: u16,
+    height: u16,
+    radius: u16,
+    blur: u16,
+    background: u32,
+    shadow: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TextKey {
+    text: String,
+    foreground: u32,
+    background: u32,
 }
 
 enum ThumbnailState {
@@ -110,6 +161,9 @@ impl Renderer {
         Ok(Self {
             overlay,
             thumbnails,
+            panel_cache: HashMap::new(),
+            shadow_cache: HashMap::new(),
+            text: TextRenderer::new(&config.ui.font),
             config: config.clone(),
         })
     }
@@ -169,13 +223,13 @@ impl Renderer {
         }
 
         for (index, (window, item)) in windows.iter().zip(&layout.items).enumerate() {
-            let cell_gc = if index == selected {
-                self.overlay.gcs.cell_hover
+            let (cell_gc, cell_color) = if index == selected {
+                (self.overlay.gcs.cell_hover, self.config.colors.cell_hover)
             } else {
-                self.overlay.gcs.cell
+                (self.overlay.gcs.cell, self.config.colors.cell)
             };
             self.draw_card_shadow(ctx, item.cell)?;
-            self.draw_cell_background(ctx, item.cell, cell_gc, index == selected)?;
+            self.draw_cell_background(ctx, item.cell, cell_gc, cell_color, index == selected)?;
 
             if self
                 .thumbnails
@@ -183,7 +237,7 @@ impl Renderer {
                 .and_then(|slot| slot.state.image())
                 .is_some()
             {
-                self.draw_cached_image(ctx, index, item.preview, cell_gc)?;
+                self.draw_cached_image(ctx, index, item.preview, cell_color)?;
             }
 
             match self.thumbnails.get(index).map(|slot| &slot.state) {
@@ -223,9 +277,10 @@ impl Renderer {
                 &window.workspace,
                 window.focused,
                 window.urgent,
+                cell_color,
             )?;
             let label = window.program_name();
-            self.draw_label(ctx, item.cell, label.as_ref())?;
+            self.draw_label(ctx, item.cell, label.as_ref(), cell_color)?;
             if !self.config.ui.rounded_corners {
                 self.draw_border(ctx, item.cell, index == selected)?;
             }
@@ -260,6 +315,17 @@ impl Renderer {
         for slot in &mut self.thumbnails {
             slot.release_prepared(ctx);
         }
+        for (_, pixmap) in self.panel_cache.drain() {
+            if let Ok(cookie) = ctx.conn.free_pixmap(pixmap) {
+                cookie.ignore_error();
+            }
+        }
+        for (_, pixmap) in self.shadow_cache.drain() {
+            if let Ok(cookie) = ctx.conn.free_pixmap(pixmap) {
+                cookie.ignore_error();
+            }
+        }
+        self.text.destroy(ctx);
         self.overlay.destroy(ctx)?;
         ctx.conn.flush().context("failed to flush cleanup")?;
         Ok(())
@@ -270,7 +336,7 @@ impl Renderer {
         ctx: &X11Context,
         index: usize,
         rect: Rect,
-        corner_gc: Gcontext,
+        corner_color: u32,
     ) -> Result<()> {
         if rect.width == 0 || rect.height == 0 {
             return Ok(());
@@ -293,6 +359,8 @@ impl Renderer {
             self.overlay.gcs.image,
             ctx.root_depth,
             target,
+            self.config.ui.rounded_corners.then_some(corner_color),
+            self.config.ui.corner_radius,
         )?
         else {
             return Ok(());
@@ -312,41 +380,32 @@ impl Renderer {
             .context("failed to copy prepared thumbnail")?
             .check()
             .context("X11 rejected prepared thumbnail copy")?;
-        if self.config.ui.rounded_corners {
-            self.cover_rounded_corners(ctx, target, self.config.ui.corner_radius, corner_gc)?;
-        }
         Ok(())
     }
 
     fn copy_card_to_overlay(&self, ctx: &X11Context, rect: Rect) -> Result<()> {
-        let spans = if self.config.ui.rounded_corners {
-            rounded_rect_spans(rect, rounded_radius(rect, self.config.ui.corner_radius))
-        } else {
-            vec![Rectangle {
-                x: rect.x,
-                y: rect.y,
-                width: rect.width,
-                height: rect.height,
-            }]
-        };
+        self.copy_buffer_region_to_overlay(ctx, rect)
+    }
 
-        for span in spans {
-            ctx.conn
-                .copy_area(
-                    self.overlay.buffer,
-                    self.overlay.window,
-                    self.overlay.gcs.image,
-                    span.x,
-                    span.y,
-                    span.x,
-                    span.y,
-                    span.width,
-                    span.height,
-                )
-                .context("failed to copy card buffer to overlay")?
-                .check()
-                .context("X11 rejected card buffer copy")?;
+    fn copy_buffer_region_to_overlay(&self, ctx: &X11Context, rect: Rect) -> Result<()> {
+        if rect.width == 0 || rect.height == 0 {
+            return Ok(());
         }
+        ctx.conn
+            .copy_area(
+                self.overlay.buffer,
+                self.overlay.window,
+                self.overlay.gcs.image,
+                rect.x,
+                rect.y,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+            )
+            .context("failed to copy buffer region to overlay")?
+            .check()
+            .context("X11 rejected buffer region copy")?;
         Ok(())
     }
 
@@ -355,16 +414,21 @@ impl Renderer {
             return rect;
         }
 
-        union_rect(
-            rect,
-            offset_rect(
-                rect,
-                self.config.ui.shadow_offset_x,
-                self.config.ui.shadow_offset_y,
-            ),
-            self.overlay.width,
-            self.overlay.height,
-        )
+        let blur = self.config.ui.shadow_radius;
+        let shadow = Rect {
+            x: rect
+                .x
+                .saturating_add(self.config.ui.shadow_offset_x)
+                .saturating_sub(blur as i16),
+            y: rect
+                .y
+                .saturating_add(self.config.ui.shadow_offset_y)
+                .saturating_sub(blur as i16),
+            width: rect.width.saturating_add(blur.saturating_mul(2)),
+            height: rect.height.saturating_add(blur.saturating_mul(2)),
+        };
+
+        union_rect(rect, shadow, self.overlay.width, self.overlay.height)
     }
 
     fn draw_status_box(&self, ctx: &X11Context, rect: Rect, message: &str) -> Result<()> {
@@ -381,32 +445,122 @@ impl Renderer {
         Ok(())
     }
 
-    fn draw_card_shadow(&self, ctx: &X11Context, rect: Rect) -> Result<()> {
+    fn draw_card_shadow(&mut self, ctx: &X11Context, rect: Rect) -> Result<()> {
         if !self.config.ui.shadows {
             return Ok(());
         }
 
-        let shadow = offset_rect(
-            rect,
-            self.config.ui.shadow_offset_x,
-            self.config.ui.shadow_offset_y,
-        );
+        let blur = self.config.ui.shadow_radius.max(1);
         let radius = if self.config.ui.rounded_corners {
-            self.config
-                .ui
-                .shadow_radius
-                .max(self.config.ui.corner_radius)
+            rounded_radius(rect, self.config.ui.corner_radius)
         } else {
-            self.config.ui.shadow_radius
+            0
         };
-        self.fill_rounded(ctx, shadow, radius, self.overlay.gcs.shadow)
+        let key = ShadowKey {
+            width: rect.width,
+            height: rect.height,
+            radius,
+            blur,
+            background: self.config.colors.background,
+            shadow: self.config.colors.shadow,
+        };
+        let pixmap = self.ensure_shadow_pixmap(ctx, key)?;
+        let dst_x = rect
+            .x
+            .saturating_add(self.config.ui.shadow_offset_x)
+            .saturating_sub(blur as i16);
+        let dst_y = rect
+            .y
+            .saturating_add(self.config.ui.shadow_offset_y)
+            .saturating_sub(blur as i16);
+        self.copy_pixmap_clipped(
+            ctx,
+            pixmap,
+            dst_x,
+            dst_y,
+            rect.width.saturating_add(blur.saturating_mul(2)),
+            rect.height.saturating_add(blur.saturating_mul(2)),
+        )
+    }
+
+    fn ensure_shadow_pixmap(&mut self, ctx: &X11Context, key: ShadowKey) -> Result<Pixmap> {
+        if let Some(pixmap) = self.shadow_cache.get(&key) {
+            return Ok(*pixmap);
+        }
+
+        let image = render_shadow_image(key);
+        let data = pixels::rgba_to_zpixmap(ctx, &image)?;
+        let pixmap = create_buffer(
+            ctx,
+            self.overlay.window,
+            key.width.saturating_add(key.blur.saturating_mul(2)),
+            key.height.saturating_add(key.blur.saturating_mul(2)),
+        )?;
+        ctx.conn
+            .put_image(
+                ImageFormat::Z_PIXMAP,
+                pixmap,
+                self.overlay.gcs.image,
+                key.width.saturating_add(key.blur.saturating_mul(2)),
+                key.height.saturating_add(key.blur.saturating_mul(2)),
+                0,
+                0,
+                0,
+                ctx.root_depth,
+                &data,
+            )
+            .context("failed to upload antialiased shadow")?
+            .check()
+            .context("X11 rejected antialiased shadow upload")?;
+        self.shadow_cache.insert(key, pixmap);
+        Ok(pixmap)
+    }
+
+    fn copy_pixmap_clipped(
+        &self,
+        ctx: &X11Context,
+        pixmap: Pixmap,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
+    ) -> Result<()> {
+        let src_left = 0i16.saturating_sub(dst_x).max(0);
+        let src_top = 0i16.saturating_sub(dst_y).max(0);
+        let clipped_dst_x = dst_x.max(0);
+        let clipped_dst_y = dst_y.max(0);
+        let right = (i32::from(dst_x) + i32::from(width)).min(i32::from(self.overlay.width));
+        let bottom = (i32::from(dst_y) + i32::from(height)).min(i32::from(self.overlay.height));
+        let clipped_width = (right - i32::from(clipped_dst_x)).max(0) as u16;
+        let clipped_height = (bottom - i32::from(clipped_dst_y)).max(0) as u16;
+        if clipped_width == 0 || clipped_height == 0 {
+            return Ok(());
+        }
+
+        ctx.conn
+            .copy_area(
+                pixmap,
+                self.overlay.buffer,
+                self.overlay.gcs.image,
+                src_left,
+                src_top,
+                clipped_dst_x,
+                clipped_dst_y,
+                clipped_width,
+                clipped_height,
+            )
+            .context("failed to copy clipped pixmap")?
+            .check()
+            .context("X11 rejected clipped pixmap copy")?;
+        Ok(())
     }
 
     fn draw_cell_background(
-        &self,
+        &mut self,
         ctx: &X11Context,
         rect: Rect,
         cell_gc: Gcontext,
+        cell_color: u32,
         selected: bool,
     ) -> Result<()> {
         if !self.config.ui.rounded_corners {
@@ -414,19 +568,67 @@ impl Renderer {
         }
 
         let thickness = border_thickness(selected);
-        let border_gc = if selected {
-            self.overlay.gcs.selected
+        let border_color = if selected {
+            self.config.colors.selected
         } else {
-            self.overlay.gcs.border
+            self.config.colors.border
         };
         let radius = rounded_radius(rect, self.config.ui.corner_radius);
-        self.fill_rounded(ctx, rect, radius, border_gc)?;
+        let key = PanelKey {
+            width: rect.width,
+            height: rect.height,
+            radius,
+            thickness,
+            background: self.config.colors.background,
+            border: border_color,
+            fill: cell_color,
+        };
+        let pixmap = self.ensure_panel_pixmap(ctx, key)?;
 
-        let inner = inset_rect(rect, thickness);
-        if inner.width > 0 && inner.height > 0 {
-            self.fill_rounded(ctx, inner, radius.saturating_sub(thickness), cell_gc)?;
-        }
+        ctx.conn
+            .copy_area(
+                pixmap,
+                self.overlay.buffer,
+                self.overlay.gcs.image,
+                0,
+                0,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+            )
+            .context("failed to copy antialiased card")?
+            .check()
+            .context("X11 rejected antialiased card copy")?;
         Ok(())
+    }
+
+    fn ensure_panel_pixmap(&mut self, ctx: &X11Context, key: PanelKey) -> Result<Pixmap> {
+        if let Some(pixmap) = self.panel_cache.get(&key) {
+            return Ok(*pixmap);
+        }
+
+        let image = render_panel_image(key);
+        let data = pixels::rgba_to_zpixmap(ctx, &image)?;
+        let pixmap = create_buffer(ctx, self.overlay.window, key.width, key.height)?;
+        ctx.conn
+            .put_image(
+                ImageFormat::Z_PIXMAP,
+                pixmap,
+                self.overlay.gcs.image,
+                key.width,
+                key.height,
+                0,
+                0,
+                0,
+                ctx.root_depth,
+                &data,
+            )
+            .context("failed to upload antialiased card")?
+            .check()
+            .context("X11 rejected antialiased card upload")?;
+        self.panel_cache.insert(key, pixmap);
+        Ok(pixmap)
     }
 
     fn fill_preview(&self, ctx: &X11Context, rect: Rect, gc: Gcontext) -> Result<()> {
@@ -438,12 +640,20 @@ impl Renderer {
     }
 
     fn draw_status(&self, ctx: &X11Context, rect: Rect, message: &str, error: bool) -> Result<()> {
-        let gc = if error {
-            self.overlay.gcs.text
+        let (foreground, background) = if error {
+            (self.config.colors.text, self.config.colors.error)
         } else {
-            self.overlay.gcs.muted
+            (self.config.colors.muted, self.config.colors.empty)
         };
-        self.draw_text_with_gc(ctx, gc, rect.x + 8, rect.y + 19, message, 48)
+        self.draw_text_with_colors(
+            ctx,
+            rect.x + 8,
+            rect.y + 19,
+            message,
+            48,
+            foreground,
+            background,
+        )
     }
 
     fn draw_workspace_badge(
@@ -453,6 +663,7 @@ impl Renderer {
         workspace: &str,
         focused: bool,
         urgent: bool,
+        background: u32,
     ) -> Result<()> {
         if !self.config.ui.show_workspace_number {
             return Ok(());
@@ -472,10 +683,18 @@ impl Renderer {
             ""
         };
         let label = format!("{marker}{workspace}");
-        self.draw_text_without_background(ctx, rect.x + 6, rect.y + 15, &label, 20)
+        self.draw_text_with_colors(
+            ctx,
+            rect.x + 6,
+            rect.y + 15,
+            &label,
+            20,
+            self.config.colors.text,
+            background,
+        )
     }
 
-    fn draw_label(&self, ctx: &X11Context, cell: Rect, label: &str) -> Result<()> {
+    fn draw_label(&self, ctx: &X11Context, cell: Rect, label: &str, background: u32) -> Result<()> {
         if !self.config.ui.show_program_name {
             return Ok(());
         }
@@ -483,7 +702,15 @@ impl Renderer {
         let max_chars = (usize::from(cell.width) / 7)
             .saturating_sub(2)
             .clamp(12, 120);
-        self.draw_text_without_background(ctx, cell.x + 10, y, label, max_chars)
+        self.draw_text_with_colors(
+            ctx,
+            cell.x + 10,
+            y,
+            label,
+            max_chars,
+            self.config.colors.text,
+            background,
+        )
     }
 
     fn draw_border(&self, ctx: &X11Context, rect: Rect, selected: bool) -> Result<()> {
@@ -559,75 +786,41 @@ impl Renderer {
         Ok(())
     }
 
-    fn cover_rounded_corners(
-        &self,
-        ctx: &X11Context,
-        rect: Rect,
-        radius: u16,
-        gc: Gcontext,
-    ) -> Result<()> {
-        let radius = rounded_radius(rect, radius);
-        if radius == 0 {
-            return Ok(());
-        }
-
-        let rectangles = rounded_corner_cutouts(rect, radius);
-        if rectangles.is_empty() {
-            return Ok(());
-        }
-        ctx.conn
-            .poly_fill_rectangle(self.overlay.buffer, gc, &rectangles)
-            .context("failed to cover rounded thumbnail corners")?;
-        Ok(())
-    }
-
     fn draw_text(&self, ctx: &X11Context, x: i16, y: i16, text: &str, max: usize) -> Result<()> {
-        self.draw_text_with_gc(ctx, self.overlay.gcs.text, x, y, text, max)
+        self.draw_text_with_colors(
+            ctx,
+            x,
+            y,
+            text,
+            max,
+            self.config.colors.text,
+            self.config.colors.error,
+        )
     }
 
-    fn draw_text_with_gc(
-        &self,
-        ctx: &X11Context,
-        gc: Gcontext,
-        x: i16,
-        y: i16,
-        text: &str,
-        max: usize,
-    ) -> Result<()> {
-        let bytes = ascii_label(text, max);
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        ctx.conn
-            .image_text8(self.overlay.buffer, gc, x, y, &bytes)
-            .context("failed to draw text")?;
-        Ok(())
-    }
-
-    fn draw_text_without_background(
+    fn draw_text_with_colors(
         &self,
         ctx: &X11Context,
         x: i16,
         y: i16,
         text: &str,
         max: usize,
+        foreground: u32,
+        background: u32,
     ) -> Result<()> {
-        let bytes = ascii_label(text, max);
-        if bytes.is_empty() {
-            return Ok(());
-        }
-
-        let mut items = Vec::with_capacity(bytes.len() + 2);
-        for chunk in bytes.chunks(254) {
-            items.push(chunk.len() as u8);
-            items.push(0);
-            items.extend_from_slice(chunk);
-        }
-
-        ctx.conn
-            .poly_text8(self.overlay.buffer, self.overlay.gcs.text, x, y, &items)
-            .context("failed to draw text without background")?;
-        Ok(())
+        self.text.draw(
+            ctx,
+            self.overlay.window,
+            self.overlay.buffer,
+            self.overlay.gcs.image,
+            ctx.root_depth,
+            x,
+            y,
+            text,
+            max,
+            foreground,
+            background,
+        )
     }
 }
 
@@ -651,12 +844,15 @@ impl ThumbnailSlot {
         gc: Gcontext,
         depth: u8,
         rect: Rect,
+        corner_background: Option<u32>,
+        corner_radius: u16,
     ) -> Result<Option<Pixmap>> {
-        if self
-            .prepared
-            .as_ref()
-            .is_some_and(|prepared| prepared.width == rect.width && prepared.height == rect.height)
-        {
+        if self.prepared.as_ref().is_some_and(|prepared| {
+            prepared.width == rect.width
+                && prepared.height == rect.height
+                && prepared.corner_background == corner_background
+                && prepared.corner_radius == corner_radius
+        }) {
             return Ok(self.prepared.as_ref().map(|prepared| prepared.pixmap));
         }
 
@@ -664,12 +860,15 @@ impl ThumbnailSlot {
             let Some(image) = self.state.image() else {
                 return Ok(None);
             };
-            let scaled = image::imageops::resize(
+            let mut scaled = image::imageops::resize(
                 image,
                 u32::from(rect.width),
                 u32::from(rect.height),
                 FilterType::Triangle,
             );
+            if let Some(background) = corner_background {
+                apply_rounded_image_mask(&mut scaled, corner_radius, background);
+            }
             let data = pixels::rgba_to_zpixmap(ctx, &scaled)?;
             let pixmap = create_buffer(ctx, drawable, rect.width, rect.height)?;
             ctx.conn
@@ -700,6 +899,8 @@ impl ThumbnailSlot {
             pixmap,
             width,
             height,
+            corner_background,
+            corner_radius,
         });
         Ok(Some(pixmap))
     }
@@ -711,6 +912,117 @@ impl ThumbnailSlot {
             }
         }
     }
+}
+
+impl TextRenderer {
+    fn new(font: &str) -> Self {
+        Self {
+            font: normalize_pango_font(font),
+            cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw(
+        &self,
+        ctx: &X11Context,
+        drawable: Window,
+        target: Pixmap,
+        gc: Gcontext,
+        depth: u8,
+        x: i16,
+        baseline_y: i16,
+        text: &str,
+        max: usize,
+        foreground: u32,
+        background: u32,
+    ) -> Result<()> {
+        let text = clipped_label(text, max);
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        let key = TextKey {
+            text,
+            foreground,
+            background,
+        };
+        if let Some(cached) = self.cache.borrow().get(&key) {
+            return copy_text_pixmap(ctx, *cached, target, gc, x, baseline_y);
+        }
+
+        let rendered = render_text_image(&self.font, &key.text, key.foreground, key.background)?;
+        let data = pixels::rgba_to_zpixmap(ctx, &rendered.image)?;
+        let pixmap = create_buffer(ctx, drawable, rendered.width, rendered.height)?;
+        ctx.conn
+            .put_image(
+                ImageFormat::Z_PIXMAP,
+                pixmap,
+                gc,
+                rendered.width,
+                rendered.height,
+                0,
+                0,
+                0,
+                depth,
+                &data,
+            )
+            .context("failed to upload text")?
+            .check()
+            .context("X11 rejected text upload")?;
+
+        let cached = TextPixmap {
+            pixmap,
+            width: rendered.width,
+            height: rendered.height,
+            baseline: rendered.baseline,
+        };
+        self.cache.borrow_mut().insert(key, cached);
+        copy_text_pixmap(ctx, cached, target, gc, x, baseline_y)
+    }
+
+    fn destroy(&self, ctx: &X11Context) {
+        for (_, cached) in self.cache.borrow_mut().drain() {
+            if let Ok(cookie) = ctx.conn.free_pixmap(cached.pixmap) {
+                cookie.ignore_error();
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RenderedText {
+    image: RgbaImage,
+    width: u16,
+    height: u16,
+    baseline: i16,
+}
+
+fn copy_text_pixmap(
+    ctx: &X11Context,
+    cached: TextPixmap,
+    target: Pixmap,
+    gc: Gcontext,
+    x: i16,
+    baseline_y: i16,
+) -> Result<()> {
+    let y = baseline_y.saturating_sub(cached.baseline);
+    ctx.conn
+        .copy_area(
+            cached.pixmap,
+            target,
+            gc,
+            0,
+            0,
+            x,
+            y,
+            cached.width,
+            cached.height,
+        )
+        .context("failed to copy rendered text")?
+        .check()
+        .context("X11 rejected rendered text copy")?;
+    Ok(())
 }
 
 impl Overlay {
@@ -885,17 +1197,17 @@ impl Gcs {
         ctx: &X11Context,
         drawable: Pixmap,
         colors: &ColorConfig,
-        font_name: &str,
+        _font_name: &str,
     ) -> Result<Self> {
         let font = ctx
             .conn
             .generate_id()
             .context("failed to allocate font id")?;
         ctx.conn
-            .open_font(font, font_name.as_bytes())
-            .with_context(|| format!("failed to open X11 font `{font_name}`"))?
+            .open_font(font, b"fixed")
+            .context("failed to open fallback X11 font `fixed`")?
             .check()
-            .with_context(|| format!("X11 rejected font `{font_name}`"))?;
+            .context("X11 rejected fallback font `fixed`")?;
 
         Ok(Self {
             bg: create_gc(ctx, drawable, colors.background, colors.background, font)?,
@@ -1032,19 +1344,317 @@ fn pict_format_for_visual(
         .map(|candidate| candidate.format)
 }
 
-fn ascii_label(text: &str, max: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(max.min(text.len()));
-    for ch in text.chars() {
-        if out.len() >= max {
-            break;
-        }
-        if ch.is_ascii_graphic() || ch == ' ' {
-            out.push(ch as u8);
-        } else if !out.last().is_some_and(|last| *last == b'?') {
-            out.push(b'?');
+fn clipped_label(text: &str, max: usize) -> String {
+    let clean: Vec<char> = text.chars().filter(|ch| !ch.is_control()).collect();
+    if clean.len() <= max {
+        return clean.into_iter().collect();
+    }
+
+    if max <= 3 {
+        clean.into_iter().take(max).collect()
+    } else {
+        let mut out: String = clean.into_iter().take(max - 3).collect();
+        out.push_str("...");
+        out
+    }
+}
+
+fn normalize_pango_font(font: &str) -> String {
+    let font = font.trim();
+    if font.contains(":size=") {
+        let mut parts = font.split(';');
+        if let Some(base) = parts.next()
+            && let Some((family, size)) = base.split_once(":size=")
+        {
+            return format!("{} {}", family.trim(), size.trim());
         }
     }
-    out
+    font.to_string()
+}
+
+fn render_text_image(
+    font: &str,
+    text: &str,
+    foreground: u32,
+    background: u32,
+) -> Result<RenderedText> {
+    let measure_surface = ImageSurface::create(Format::ARgb32, 1, 1)
+        .context("failed to create text measure surface")?;
+    let measure_context =
+        CairoContext::new(&measure_surface).context("failed to create text measure context")?;
+    let layout = pangocairo::functions::create_layout(&measure_context);
+    layout.set_text(text);
+    layout.set_font_description(Some(&FontDescription::from_string(font)));
+    let (_, logical) = layout.pixel_extents();
+    let width = logical.width().max(1).min(i32::from(u16::MAX)) as u16;
+    let height = logical.height().max(1).min(i32::from(u16::MAX)) as u16;
+    let baseline = ((layout.baseline() / pango::SCALE) - logical.y())
+        .max(1)
+        .min(i32::from(i16::MAX)) as i16;
+
+    let mut surface = ImageSurface::create(Format::ARgb32, i32::from(width), i32::from(height))
+        .context("failed to create text surface")?;
+    let context = CairoContext::new(&surface).context("failed to create text cairo context")?;
+    let [br, bg, bb] = unpack_rgb(background);
+    context.set_source_rgb(
+        f64::from(br) / 255.0,
+        f64::from(bg) / 255.0,
+        f64::from(bb) / 255.0,
+    );
+    context.paint().context("failed to paint text background")?;
+
+    let [fr, fg, fb] = unpack_rgb(foreground);
+    context.set_source_rgb(
+        f64::from(fr) / 255.0,
+        f64::from(fg) / 255.0,
+        f64::from(fb) / 255.0,
+    );
+    context.move_to(f64::from(-logical.x()), f64::from(-logical.y()));
+    let layout = pangocairo::functions::create_layout(&context);
+    layout.set_text(text);
+    layout.set_font_description(Some(&FontDescription::from_string(font)));
+    pangocairo::functions::show_layout(&context, &layout);
+    drop(layout);
+    drop(context);
+    surface.flush();
+
+    let stride = surface.stride() as usize;
+    let data = surface
+        .data()
+        .map_err(|err| anyhow!("failed to read text surface data: {err}"))?;
+    let mut image = RgbaImage::new(u32::from(width), u32::from(height));
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let offset = y * stride + x * 4;
+            let blue = data[offset];
+            let green = data[offset + 1];
+            let red = data[offset + 2];
+            image.put_pixel(x as u32, y as u32, Rgba([red, green, blue, 255]));
+        }
+    }
+
+    Ok(RenderedText {
+        image,
+        width,
+        height,
+        baseline,
+    })
+}
+
+fn render_shadow_image(key: ShadowKey) -> RgbaImage {
+    let width = key.width.saturating_add(key.blur.saturating_mul(2));
+    let height = key.height.saturating_add(key.blur.saturating_mul(2));
+    let mut image = RgbaImage::new(u32::from(width), u32::from(height));
+    let background = unpack_rgb(key.background);
+    let shadow = unpack_rgb(key.shadow);
+    let blur = f32::from(key.blur.max(1));
+    let max_alpha = 0.58;
+
+    for y in 0..height {
+        for x in 0..width {
+            let distance = rounded_rect_signed_distance(
+                f32::from(x) + 0.5,
+                f32::from(y) + 0.5,
+                blur,
+                blur,
+                blur + f32::from(key.width),
+                blur + f32::from(key.height),
+                f32::from(key.radius),
+            );
+            let alpha = if distance <= 0.0 {
+                max_alpha
+            } else if distance < blur {
+                let t = 1.0 - distance / blur;
+                max_alpha * t * t
+            } else {
+                0.0
+            };
+            let rgb = blend_rgb(background, shadow, alpha);
+            image.put_pixel(x.into(), y.into(), Rgba([rgb[0], rgb[1], rgb[2], 255]));
+        }
+    }
+
+    image
+}
+
+fn render_panel_image(key: PanelKey) -> RgbaImage {
+    let mut image = RgbaImage::new(u32::from(key.width), u32::from(key.height));
+    let background = unpack_rgb(key.background);
+    let border = unpack_rgb(key.border);
+    let fill = unpack_rgb(key.fill);
+    let inner_left = f32::from(key.thickness);
+    let inner_top = f32::from(key.thickness);
+    let inner_right = f32::from(key.width.saturating_sub(key.thickness));
+    let inner_bottom = f32::from(key.height.saturating_sub(key.thickness));
+    let inner_radius = key.radius.saturating_sub(key.thickness);
+
+    for y in 0..key.height {
+        for x in 0..key.width {
+            let outer_coverage = rounded_rect_coverage(
+                f32::from(x),
+                f32::from(y),
+                0.0,
+                0.0,
+                f32::from(key.width),
+                f32::from(key.height),
+                f32::from(key.radius),
+            );
+            let inner_coverage = if inner_right > inner_left && inner_bottom > inner_top {
+                rounded_rect_coverage(
+                    f32::from(x),
+                    f32::from(y),
+                    inner_left,
+                    inner_top,
+                    inner_right,
+                    inner_bottom,
+                    f32::from(inner_radius),
+                )
+            } else {
+                0.0
+            };
+            let with_border = blend_rgb(background, border, outer_coverage);
+            let rgb = blend_rgb(with_border, fill, inner_coverage);
+            image.put_pixel(x.into(), y.into(), Rgba([rgb[0], rgb[1], rgb[2], 255]));
+        }
+    }
+
+    image
+}
+
+fn apply_rounded_image_mask(image: &mut RgbaImage, radius: u16, background: u32) {
+    let width = image.width();
+    let height = image.height();
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let radius = f32::from(radius)
+        .min(width as f32 / 2.0)
+        .min(height as f32 / 2.0);
+    if radius <= 0.0 {
+        return;
+    }
+
+    let background = unpack_rgb(background);
+    for y in 0..height {
+        for x in 0..width {
+            let coverage = rounded_rect_coverage(
+                x as f32,
+                y as f32,
+                0.0,
+                0.0,
+                width as f32,
+                height as f32,
+                radius,
+            );
+            if coverage >= 1.0 {
+                continue;
+            }
+            let source = image.get_pixel(x, y).0;
+            let rgb = blend_rgb(background, [source[0], source[1], source[2]], coverage);
+            image.put_pixel(x, y, Rgba([rgb[0], rgb[1], rgb[2], 255]));
+        }
+    }
+}
+
+fn rounded_rect_coverage(
+    pixel_x: f32,
+    pixel_y: f32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    radius: f32,
+) -> f32 {
+    const SAMPLES: u16 = 4;
+    let mut covered = 0u16;
+    for sample_y in 0..SAMPLES {
+        for sample_x in 0..SAMPLES {
+            let x = pixel_x + (f32::from(sample_x) + 0.5) / f32::from(SAMPLES);
+            let y = pixel_y + (f32::from(sample_y) + 0.5) / f32::from(SAMPLES);
+            if inside_rounded_rect(x, y, left, top, right, bottom, radius) {
+                covered += 1;
+            }
+        }
+    }
+    f32::from(covered) / f32::from(SAMPLES * SAMPLES)
+}
+
+fn inside_rounded_rect(
+    x: f32,
+    y: f32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    radius: f32,
+) -> bool {
+    if x < left || x >= right || y < top || y >= bottom {
+        return false;
+    }
+    if radius <= 0.0 {
+        return true;
+    }
+
+    let radius = radius.min((right - left) / 2.0).min((bottom - top) / 2.0);
+    let nearest_x = x.clamp(left + radius, right - radius);
+    let nearest_y = y.clamp(top + radius, bottom - radius);
+    let dx = x - nearest_x;
+    let dy = y - nearest_y;
+    dx * dx + dy * dy <= radius * radius
+}
+
+fn rounded_rect_signed_distance(
+    x: f32,
+    y: f32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    radius: f32,
+) -> f32 {
+    let radius = radius
+        .max(0.0)
+        .min((right - left) / 2.0)
+        .min((bottom - top) / 2.0);
+    let center_x = (left + right) / 2.0;
+    let center_y = (top + bottom) / 2.0;
+    let half_x = ((right - left) / 2.0 - radius).max(0.0);
+    let half_y = ((bottom - top) / 2.0 - radius).max(0.0);
+    let qx = (x - center_x).abs() - half_x;
+    let qy = (y - center_y).abs() - half_y;
+    let outside_x = qx.max(0.0);
+    let outside_y = qy.max(0.0);
+    let outside = (outside_x * outside_x + outside_y * outside_y).sqrt();
+    let inside = qx.max(qy).min(0.0);
+    outside + inside - radius
+}
+
+fn unpack_rgb(color: u32) -> [u8; 3] {
+    [
+        ((color >> 16) & 0xff) as u8,
+        ((color >> 8) & 0xff) as u8,
+        (color & 0xff) as u8,
+    ]
+}
+
+fn blend_rgb(base: [u8; 3], overlay: [u8; 3], alpha: f32) -> [u8; 3] {
+    if alpha <= 0.0 {
+        return base;
+    }
+    if alpha >= 1.0 {
+        return overlay;
+    }
+
+    [
+        blend_channel(base[0], overlay[0], alpha),
+        blend_channel(base[1], overlay[1], alpha),
+        blend_channel(base[2], overlay[2], alpha),
+    ]
+}
+
+fn blend_channel(base: u8, overlay: u8, alpha: f32) -> u8 {
+    (f32::from(base) + (f32::from(overlay) - f32::from(base)) * alpha).round() as u8
 }
 
 fn fit_image(area: Rect, source_width: u32, source_height: u32) -> Rect {
@@ -1085,26 +1695,6 @@ fn rounded_div(value: u64, divisor: u64) -> u32 {
 
 fn border_thickness(selected: bool) -> u16 {
     if selected { 4 } else { 2 }
-}
-
-fn inset_rect(rect: Rect, amount: u16) -> Rect {
-    let inset_x = amount.min(rect.width / 2);
-    let inset_y = amount.min(rect.height / 2);
-    Rect {
-        x: rect.x + inset_x as i16,
-        y: rect.y + inset_y as i16,
-        width: rect.width.saturating_sub(inset_x.saturating_mul(2)),
-        height: rect.height.saturating_sub(inset_y.saturating_mul(2)),
-    }
-}
-
-fn offset_rect(rect: Rect, offset_x: i16, offset_y: i16) -> Rect {
-    Rect {
-        x: rect.x.saturating_add(offset_x),
-        y: rect.y.saturating_add(offset_y),
-        width: rect.width,
-        height: rect.height,
-    }
 }
 
 fn union_rect(a: Rect, b: Rect, max_width: u16, max_height: u16) -> Rect {
@@ -1162,59 +1752,6 @@ fn rounded_rect_spans(rect: Rect, radius: u16) -> Vec<Rectangle> {
         );
     }
     spans
-}
-
-fn rounded_corner_cutouts(rect: Rect, radius: u16) -> Vec<Rectangle> {
-    let mut cutouts = Vec::new();
-    for row in 0..radius {
-        let offset = corner_offset(radius, row);
-        if offset == 0 {
-            continue;
-        }
-
-        let top_y = rect.y + row as i16;
-        push_span(
-            &mut cutouts,
-            Rectangle {
-                x: rect.x,
-                y: top_y,
-                width: offset,
-                height: 1,
-            },
-        );
-        push_span(
-            &mut cutouts,
-            Rectangle {
-                x: rect.x + rect.width as i16 - offset as i16,
-                y: top_y,
-                width: offset,
-                height: 1,
-            },
-        );
-
-        let bottom_y = rect.y + rect.height as i16 - row as i16 - 1;
-        if bottom_y != top_y {
-            push_span(
-                &mut cutouts,
-                Rectangle {
-                    x: rect.x,
-                    y: bottom_y,
-                    width: offset,
-                    height: 1,
-                },
-            );
-            push_span(
-                &mut cutouts,
-                Rectangle {
-                    x: rect.x + rect.width as i16 - offset as i16,
-                    y: bottom_y,
-                    width: offset,
-                    height: 1,
-                },
-            );
-        }
-    }
-    cutouts
 }
 
 fn rounded_row_offset(radius: u16, row: u16, height: u16) -> u16 {

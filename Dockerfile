@@ -8,6 +8,8 @@ RUN apt-get update \
         libxrender-dev \
         libxdamage-dev \
         libxfixes-dev \
+        libcairo2-dev \
+        libpango1.0-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
