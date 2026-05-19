@@ -30,10 +30,10 @@ pub struct Layout {
 
 pub fn compute(screen_width: u16, screen_height: u16, windows: &[WindowInfo]) -> Layout {
     let count = windows.len().max(1);
-    let margin = 48u16.min(screen_width / 8).min(screen_height / 8);
-    let gap = 22u16;
-    let label_height = 28u16;
-    let padding = 10u16;
+    let margin = 24u16.min(screen_width / 10).min(screen_height / 10);
+    let gap = if count <= 3 { 12u16 } else { 18u16 };
+    let label_height = 34u16;
+    let padding = 12u16;
     let (columns, rows) = choose_grid(count, screen_width, screen_height);
 
     let total_gap_x = gap.saturating_mul(columns.saturating_sub(1) as u16);
@@ -102,6 +102,13 @@ pub fn hit_test(layout: &Layout, x: i16, y: i16) -> Option<usize> {
 }
 
 fn choose_grid(count: usize, screen_width: u16, screen_height: u16) -> (usize, usize) {
+    match count {
+        0 | 1 => return (1, 1),
+        2 => return (2, 1),
+        3 => return (3, 1),
+        _ => {}
+    }
+
     let aspect = screen_width as f32 / screen_height.max(1) as f32;
     let mut columns = ((count as f32 * aspect).sqrt().ceil() as usize).max(1);
     columns = columns.min(count);

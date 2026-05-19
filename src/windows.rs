@@ -17,6 +17,12 @@ pub struct WindowInfo {
     pub name: String,
     pub instance: Option<String>,
     pub class: Option<String>,
+    pub workspace: String,
+    pub workspace_num: Option<i32>,
+    pub i3_con_id: Option<i64>,
+    pub tree_order: usize,
+    pub urgent: bool,
+    pub focused: bool,
     pub geometry: WindowGeometry,
 }
 
@@ -31,6 +37,16 @@ pub struct WindowGeometry {
 }
 
 pub fn discover_windows(ctx: &X11Context, atoms: &Atoms, debug: bool) -> Result<Vec<WindowInfo>> {
+    match crate::i3::discover_windows(ctx, debug) {
+        Ok(windows) => return Ok(windows),
+        Err(error) if debug => {
+            eprintln!(
+                "windows: i3 IPC discovery failed, falling back to visible X11 clients: {error:#}"
+            );
+        }
+        Err(_) => {}
+    }
+
     let mut ids = read_window_list(ctx, atoms.net_client_list_stacking)?;
     if ids.is_empty() {
         ids = read_window_list(ctx, atoms.net_client_list)?;
@@ -47,13 +63,19 @@ pub fn discover_windows(ctx: &X11Context, atoms: &Atoms, debug: bool) -> Result<
         }
 
         match inspect_window(ctx, atoms, id, debug)? {
-            Some(info) => windows.push(info),
+            Some(mut info) => {
+                info.tree_order = windows.len();
+                windows.push(info);
+            }
             None => continue,
         }
     }
 
     if debug {
-        eprintln!("windows: {} visible client windows detected", windows.len());
+        eprintln!(
+            "windows: {} visible client windows detected via X11 fallback",
+            windows.len()
+        );
     }
 
     Ok(windows)
@@ -67,8 +89,15 @@ pub fn print_window_list(windows: &[WindowInfo]) {
             .or(window.instance.as_deref())
             .unwrap_or("-");
         println!(
-            "{:>2}. 0x{:08x} {:>4}x{:<4} {:+5}{:+5} depth={} visual=0x{:08x} class={} name={}",
+            "{:>2}. ws={:<10} con={:<14} flags={}{} 0x{:08x} {:>4}x{:<4} {:+5}{:+5} depth={} visual=0x{:08x} class={} name={}",
             index + 1,
+            window.workspace,
+            window
+                .i3_con_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            if window.focused { "F" } else { "-" },
+            if window.urgent { "U" } else { "-" },
             window.id,
             window.geometry.width,
             window.geometry.height,
@@ -82,16 +111,34 @@ pub fn print_window_list(windows: &[WindowInfo]) {
     }
 }
 
-pub fn focus_window(ctx: &X11Context, atoms: &Atoms, window: Window, debug: bool) -> Result<()> {
+pub fn focus_window(
+    ctx: &X11Context,
+    atoms: &Atoms,
+    window: &WindowInfo,
+    debug: bool,
+) -> Result<()> {
+    if let Some(con_id) = window.i3_con_id {
+        match crate::i3::focus_con(con_id, debug) {
+            Ok(()) => return Ok(()),
+            Err(error) if debug => {
+                eprintln!(
+                    "focus: i3 focus for con_id={con_id} failed, falling back to EWMH: {error:#}"
+                );
+            }
+            Err(_) => {}
+        }
+    }
+
+    let id = window.id;
     if debug {
-        eprintln!("focus: requesting _NET_ACTIVE_WINDOW for 0x{window:08x}");
+        eprintln!("focus: requesting _NET_ACTIVE_WINDOW for 0x{id:08x}");
     }
 
     let event = ClientMessageEvent {
         response_type: CLIENT_MESSAGE_EVENT,
         format: 32,
         sequence: 0,
-        window,
+        window: id,
         type_: atoms.net_active_window,
         data: ClientMessageData::from([2, CURRENT_TIME, 0, 0, 0]),
     };
@@ -109,14 +156,14 @@ pub fn focus_window(ctx: &X11Context, atoms: &Atoms, window: Window, debug: bool
 
     if let Ok(cookie) = ctx
         .conn
-        .set_input_focus(InputFocus::POINTER_ROOT, window, CURRENT_TIME)
+        .set_input_focus(InputFocus::POINTER_ROOT, id, CURRENT_TIME)
     {
         cookie.ignore_error();
     }
-    if let Ok(cookie) = ctx.conn.configure_window(
-        window,
-        &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-    ) {
+    if let Ok(cookie) = ctx
+        .conn
+        .configure_window(id, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))
+    {
         cookie.ignore_error();
     }
     ctx.conn.flush().context("failed to flush focus requests")?;
@@ -217,6 +264,12 @@ fn inspect_window(
         name,
         instance,
         class,
+        workspace: "current".to_string(),
+        workspace_num: None,
+        i3_con_id: None,
+        tree_order: 0,
+        urgent: false,
+        focused: false,
         geometry: WindowGeometry {
             x,
             y,
@@ -239,7 +292,7 @@ fn read_window_name(ctx: &X11Context, atoms: &Atoms, window: Window) -> Option<S
     })
 }
 
-fn read_wm_class(ctx: &X11Context, window: Window) -> (Option<String>, Option<String>) {
+pub(crate) fn read_wm_class(ctx: &X11Context, window: Window) -> (Option<String>, Option<String>) {
     let Some(reply) = get_property(
         ctx,
         window,

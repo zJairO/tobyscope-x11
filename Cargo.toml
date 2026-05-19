@@ -5,4 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+dirs-next = "2.0"
+i3ipc = "0.10.1"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 x11rb = { version = "0.13.2", features = ["composite", "render"] }

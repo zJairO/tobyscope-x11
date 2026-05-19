@@ -4,8 +4,10 @@ use x11rb::protocol::Event;
 use x11rb::protocol::xproto::ButtonIndex;
 
 use crate::atoms::Atoms;
+use crate::cache::ThumbnailCache;
+use crate::capture::{CaptureSweep, SweepStatus};
 use crate::input::{KeyAction, KeyMap};
-use crate::layout;
+use crate::layout::{self, Layout};
 use crate::render::Renderer;
 use crate::windows::{self, WindowInfo};
 use crate::x11::X11Context;
@@ -14,6 +16,7 @@ pub struct OverviewApp {
     ctx: X11Context,
     atoms: Atoms,
     windows: Vec<WindowInfo>,
+    cache: ThumbnailCache,
     renderer: Renderer,
     keymap: KeyMap,
     selected: usize,
@@ -27,12 +30,15 @@ impl OverviewApp {
         windows: Vec<WindowInfo>,
         debug: bool,
     ) -> Result<Self> {
-        let renderer = Renderer::new(&ctx, &windows, debug)?;
+        let cache = ThumbnailCache::new(&windows, debug)?;
+        cache.prune()?;
+        let renderer = Renderer::new(&ctx, &windows, &cache, debug)?;
         let keymap = KeyMap::load(&ctx)?;
         Ok(Self {
             ctx,
             atoms,
             windows,
+            cache,
             renderer,
             keymap,
             selected: 0,
@@ -54,67 +60,116 @@ impl OverviewApp {
         cleanup?;
 
         if let Some(window) = target {
-            windows::focus_window(&self.ctx, &self.atoms, window, self.debug)?;
+            windows::focus_window(&self.ctx, &self.atoms, &window, self.debug)?;
         }
 
         Ok(())
     }
 
-    fn event_loop(&mut self) -> Result<Option<u32>> {
+    fn event_loop(&mut self) -> Result<Option<WindowInfo>> {
+        let mut sweep = Some(CaptureSweep::new(&self.windows, self.debug));
         let mut layout = self.redraw()?;
 
         loop {
-            match self
+            while let Some(event) = self
+                .ctx
+                .conn
+                .poll_for_event()
+                .context("failed while polling for X11 event")?
+            {
+                if let Some(result) = self.handle_event(event, &mut layout)? {
+                    if let Some(sweep) = sweep.as_mut() {
+                        sweep.cancel();
+                    }
+                    return Ok(result);
+                }
+            }
+
+            if let Some(active_sweep) = sweep.as_mut() {
+                match active_sweep.step(
+                    &self.ctx,
+                    &self.cache,
+                    &self.windows,
+                    &mut self.renderer,
+                )? {
+                    SweepStatus::Updated => {
+                        layout = self.redraw()?;
+                        continue;
+                    }
+                    SweepStatus::Finished => {
+                        sweep = None;
+                        layout = self.redraw()?;
+                        continue;
+                    }
+                }
+            }
+
+            let event = self
                 .ctx
                 .conn
                 .wait_for_event()
-                .context("failed while waiting for X11 event")?
-            {
-                Event::Expose(_) => {
-                    layout = self.redraw()?;
+                .context("failed while waiting for X11 event")?;
+            if let Some(result) = self.handle_event(event, &mut layout)? {
+                if let Some(sweep) = sweep.as_mut() {
+                    sweep.cancel();
                 }
-                Event::ConfigureNotify(event) if event.window == self.renderer.overlay_window() => {
-                    self.renderer.update_size(event.width, event.height);
-                    layout = self.redraw()?;
-                }
-                Event::KeyPress(event) => {
-                    if let Some(action) = self.keymap.action_for_keycode(event.detail) {
-                        match action {
-                            KeyAction::Close => return Ok(None),
-                            KeyAction::Confirm => return Ok(Some(self.windows[self.selected].id)),
-                            KeyAction::Left => self.move_left(&layout),
-                            KeyAction::Right => self.move_right(&layout),
-                            KeyAction::Up => self.move_up(&layout),
-                            KeyAction::Down => self.move_down(&layout),
-                        }
-                        layout = self.redraw()?;
-                    }
-                }
-                Event::MotionNotify(event) => {
-                    if let Some(index) = layout::hit_test(&layout, event.event_x, event.event_y) {
-                        if index != self.selected {
-                            self.selected = index;
-                            layout = self.redraw()?;
-                        }
-                    }
-                }
-                Event::ButtonPress(event) => {
-                    if u8::from(event.detail) == u8::from(ButtonIndex::M1) {
-                        if let Some(index) = layout::hit_test(&layout, event.event_x, event.event_y)
-                        {
-                            self.selected = index;
-                            return Ok(Some(self.windows[self.selected].id));
-                        }
-                    }
-                }
-                Event::Error(error) => {
-                    if self.debug {
-                        eprintln!("x11 event error: {error:?}");
-                    }
-                }
-                _ => {}
+                return Ok(result);
             }
         }
+    }
+
+    fn handle_event(
+        &mut self,
+        event: Event,
+        layout: &mut Layout,
+    ) -> Result<Option<Option<WindowInfo>>> {
+        match event {
+            Event::Expose(_) => {
+                *layout = self.redraw()?;
+            }
+            Event::ConfigureNotify(event) if event.window == self.renderer.overlay_window() => {
+                self.renderer.update_size(event.width, event.height);
+                *layout = self.redraw()?;
+            }
+            Event::KeyPress(event) => {
+                if let Some(action) = self.keymap.action_for_keycode(event.detail) {
+                    match action {
+                        KeyAction::Close => return Ok(Some(None)),
+                        KeyAction::Confirm => {
+                            return Ok(Some(Some(self.windows[self.selected].clone())));
+                        }
+                        KeyAction::Left => self.move_left(layout),
+                        KeyAction::Right => self.move_right(layout),
+                        KeyAction::Up => self.move_up(layout),
+                        KeyAction::Down => self.move_down(layout),
+                    }
+                    *layout = self.redraw()?;
+                }
+            }
+            Event::MotionNotify(event) => {
+                if let Some(index) = layout::hit_test(layout, event.event_x, event.event_y) {
+                    if index != self.selected {
+                        self.selected = index;
+                        *layout = self.redraw()?;
+                    }
+                }
+            }
+            Event::ButtonPress(event) => {
+                if u8::from(event.detail) == u8::from(ButtonIndex::M1) {
+                    if let Some(index) = layout::hit_test(layout, event.event_x, event.event_y) {
+                        self.selected = index;
+                        return Ok(Some(Some(self.windows[self.selected].clone())));
+                    }
+                }
+            }
+            Event::Error(error) => {
+                if self.debug {
+                    eprintln!("x11 event error: {error:?}");
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
     }
 
     fn redraw(&self) -> Result<layout::Layout> {

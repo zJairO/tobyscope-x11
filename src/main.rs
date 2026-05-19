@@ -1,8 +1,12 @@
 mod app;
 mod atoms;
+mod cache;
+mod capture;
 mod cli;
+mod i3;
 mod input;
 mod layout;
+mod pixels;
 mod render;
 mod windows;
 mod x11;
@@ -22,7 +26,7 @@ fn main() -> Result<()> {
     }
 
     if windows.is_empty() {
-        eprintln!("tobyscope-x11: no visible X11 client windows found");
+        eprintln!("tobyscope-x11: no i3/X11 client windows found");
         return Ok(());
     }
 

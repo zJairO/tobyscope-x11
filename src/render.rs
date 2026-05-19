@@ -1,19 +1,21 @@
 use anyhow::{Context, Result, bail};
+use image::RgbaImage;
+use image::imageops::FilterType;
+use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
-use x11rb::protocol::composite::{ConnectionExt as CompositeConnectionExt, Redirect};
 use x11rb::protocol::render::{
-    ConnectionExt as RenderConnectionExt, CreatePictureAux, PictOp, Pictformat, Picture,
-    QueryPictFormatsReply, Transform,
+    ConnectionExt as RenderConnectionExt, CreatePictureAux, Pictformat, Picture,
+    QueryPictFormatsReply,
 };
 use x11rb::protocol::xproto::{
     AtomEnum, ConnectionExt as XprotoConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Font,
-    Gcontext, GrabMode, GrabStatus, Pixmap, PropMode, Rectangle, SubwindowMode, Visualid, Window,
-    WindowClass,
+    Gcontext, GrabMode, GrabStatus, ImageFormat, PropMode, Rectangle, Window, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
-use x11rb::{CURRENT_TIME, NONE};
 
+use crate::cache::ThumbnailCache;
 use crate::layout::{Layout, Rect};
+use crate::pixels;
 use crate::windows::WindowInfo;
 use crate::x11::X11Context;
 
@@ -23,7 +25,10 @@ const COLOR_CELL_HOVER: u32 = 0x2b3642;
 const COLOR_BORDER: u32 = 0x5f6f7f;
 const COLOR_SELECTED: u32 = 0x4ea1ff;
 const COLOR_TEXT: u32 = 0xe8edf2;
+const COLOR_MUTED: u32 = 0x95a3b2;
 const COLOR_ERROR: u32 = 0x66303a;
+const COLOR_EMPTY: u32 = 0x151b21;
+const COLOR_BADGE: u32 = 0x26394d;
 const APP_ID: &str = "tobyscope-x11";
 
 pub struct Renderer {
@@ -46,30 +51,35 @@ struct Gcs {
     border: Gcontext,
     selected: Gcontext,
     text: Gcontext,
+    muted: Gcontext,
     error: Gcontext,
+    empty: Gcontext,
+    badge: Gcontext,
+    image: Gcontext,
     font: Font,
 }
 
 struct ThumbnailSlot {
-    window: Window,
-    redirected: bool,
     state: ThumbnailState,
 }
 
 enum ThumbnailState {
-    Ready(Thumbnail),
-    Error(String),
-}
-
-struct Thumbnail {
-    pixmap: Pixmap,
-    picture: Picture,
-    width: u16,
-    height: u16,
+    Image(RgbaImage),
+    Refreshing(Option<RgbaImage>),
+    Missing,
+    Error {
+        message: String,
+        image: Option<RgbaImage>,
+    },
 }
 
 impl Renderer {
-    pub fn new(ctx: &X11Context, windows: &[WindowInfo], debug: bool) -> Result<Self> {
+    pub fn new(
+        ctx: &X11Context,
+        windows: &[WindowInfo],
+        cache: &ThumbnailCache,
+        debug: bool,
+    ) -> Result<Self> {
         let formats = ctx
             .conn
             .render_query_pict_formats()
@@ -79,8 +89,19 @@ impl Renderer {
         let overlay = Overlay::create(ctx, &formats)?;
         let thumbnails = windows
             .iter()
-            .map(|window| ThumbnailSlot::create(ctx, &formats, window, debug))
-            .collect::<Vec<_>>();
+            .map(|window| {
+                let state = match cache.load(window) {
+                    Some(image) => {
+                        if debug {
+                            eprintln!("cache: hit for 0x{:08x} `{}`", window.id, window.name);
+                        }
+                        ThumbnailState::Image(image)
+                    }
+                    None => ThumbnailState::Missing,
+                };
+                ThumbnailSlot { state }
+            })
+            .collect();
 
         Ok(Self {
             overlay,
@@ -101,6 +122,26 @@ impl Renderer {
         self.overlay.height = height;
     }
 
+    pub fn set_refreshing(&mut self, index: usize) {
+        if let Some(slot) = self.thumbnails.get_mut(index) {
+            let image = slot.state.image().cloned();
+            slot.state = ThumbnailState::Refreshing(image);
+        }
+    }
+
+    pub fn set_image(&mut self, index: usize, image: RgbaImage) {
+        if let Some(slot) = self.thumbnails.get_mut(index) {
+            slot.state = ThumbnailState::Image(image);
+        }
+    }
+
+    pub fn set_error(&mut self, index: usize, message: String) {
+        if let Some(slot) = self.thumbnails.get_mut(index) {
+            let image = slot.state.image().cloned();
+            slot.state = ThumbnailState::Error { message, image };
+        }
+    }
+
     pub fn redraw(
         &self,
         ctx: &X11Context,
@@ -119,17 +160,47 @@ impl Renderer {
             self.fill(ctx, item.cell, cell_gc)?;
 
             match self.thumbnails.get(index).map(|slot| &slot.state) {
-                Some(ThumbnailState::Ready(thumbnail)) => {
-                    self.draw_thumbnail(ctx, thumbnail, item.preview)?;
+                Some(ThumbnailState::Image(image)) => {
+                    self.draw_cached_image(ctx, image, item.preview)?;
                 }
-                Some(ThumbnailState::Error(error)) => {
-                    self.draw_preview_error(ctx, item.preview, error)?;
+                Some(ThumbnailState::Refreshing(Some(image))) => {
+                    self.draw_cached_image(ctx, image, item.preview)?;
+                    self.draw_status(ctx, item.preview, "refreshing", false)?;
+                }
+                Some(ThumbnailState::Refreshing(None)) => {
+                    self.draw_status_box(ctx, item.preview, "capturing")?;
+                }
+                Some(ThumbnailState::Missing) => {
+                    self.draw_status_box(ctx, item.preview, "waiting for thumbnail")?;
+                }
+                Some(ThumbnailState::Error {
+                    message,
+                    image: Some(image),
+                }) => {
+                    self.draw_cached_image(ctx, image, item.preview)?;
+                    self.draw_status(ctx, item.preview, "refresh failed", true)?;
+                    if item.preview.height > 70 {
+                        self.draw_text(ctx, item.preview.x + 8, item.preview.y + 36, message, 72)?;
+                    }
+                }
+                Some(ThumbnailState::Error {
+                    message,
+                    image: None,
+                }) => {
+                    self.draw_error_box(ctx, item.preview, message)?;
                 }
                 None => {
-                    self.draw_preview_error(ctx, item.preview, "preview missing")?;
+                    self.draw_error_box(ctx, item.preview, "preview missing")?;
                 }
             }
 
+            self.draw_workspace_badge(
+                ctx,
+                item.cell,
+                &window.workspace,
+                window.focused,
+                window.urgent,
+            )?;
             self.draw_label(ctx, item.cell, &window.name)?;
             self.draw_border(ctx, item.cell, index == selected)?;
         }
@@ -139,82 +210,97 @@ impl Renderer {
     }
 
     pub fn cleanup(&mut self, ctx: &X11Context) -> Result<()> {
-        for slot in &self.thumbnails {
-            if let ThumbnailState::Ready(thumbnail) = &slot.state {
-                if let Ok(cookie) = ctx.conn.render_free_picture(thumbnail.picture) {
-                    cookie.ignore_error();
-                }
-                if let Ok(cookie) = ctx.conn.free_pixmap(thumbnail.pixmap) {
-                    cookie.ignore_error();
-                }
-            }
-            if slot.redirected {
-                if let Ok(cookie) = ctx
-                    .conn
-                    .composite_unredirect_window(slot.window, Redirect::AUTOMATIC)
-                {
-                    cookie.ignore_error();
-                }
-            }
-        }
-
         self.overlay.destroy(ctx)?;
         ctx.conn.flush().context("failed to flush cleanup")?;
         Ok(())
     }
 
-    fn draw_thumbnail(&self, ctx: &X11Context, thumbnail: &Thumbnail, rect: Rect) -> Result<()> {
+    fn draw_cached_image(&self, ctx: &X11Context, image: &RgbaImage, rect: Rect) -> Result<()> {
         if rect.width == 0 || rect.height == 0 {
             return Ok(());
         }
-
-        let transform = Transform {
-            matrix11: fixed_ratio(thumbnail.width, rect.width),
-            matrix12: 0,
-            matrix13: 0,
-            matrix21: 0,
-            matrix22: fixed_ratio(thumbnail.height, rect.height),
-            matrix23: 0,
-            matrix31: 0,
-            matrix32: 0,
-            matrix33: 1 << 16,
-        };
-
+        let scaled = image::imageops::resize(
+            image,
+            u32::from(rect.width),
+            u32::from(rect.height),
+            FilterType::Triangle,
+        );
+        let data = pixels::rgba_to_zpixmap(ctx, &scaled)?;
         ctx.conn
-            .render_set_picture_transform(thumbnail.picture, transform)
-            .context("failed to set thumbnail transform")?
-            .check()
-            .context("XRender rejected thumbnail transform")?;
-        ctx.conn
-            .render_composite(
-                PictOp::SRC,
-                thumbnail.picture,
-                NONE,
-                self.overlay.picture,
-                0,
-                0,
-                0,
-                0,
-                rect.x,
-                rect.y,
+            .put_image(
+                ImageFormat::Z_PIXMAP,
+                self.overlay.window,
+                self.overlay.gcs.image,
                 rect.width,
                 rect.height,
+                rect.x,
+                rect.y,
+                0,
+                ctx.root_depth,
+                &data,
             )
-            .context("failed to composite thumbnail")?
+            .context("failed to put thumbnail image")?
             .check()
-            .context("XRender rejected thumbnail composite")?;
+            .context("X11 rejected thumbnail put_image")?;
         Ok(())
     }
 
-    fn draw_preview_error(&self, ctx: &X11Context, rect: Rect, message: &str) -> Result<()> {
+    fn draw_status_box(&self, ctx: &X11Context, rect: Rect, message: &str) -> Result<()> {
+        self.fill(ctx, rect, self.overlay.gcs.empty)?;
+        self.draw_status(ctx, rect, message, false)
+    }
+
+    fn draw_error_box(&self, ctx: &X11Context, rect: Rect, message: &str) -> Result<()> {
         self.fill(ctx, rect, self.overlay.gcs.error)?;
-        let label = format!("preview error: {message}");
-        self.draw_text(ctx, rect.x + 8, rect.y + (rect.height as i16 / 2), &label)
+        self.draw_status(ctx, rect, "preview error", true)?;
+        if rect.height > 48 {
+            self.draw_text(ctx, rect.x + 8, rect.y + 38, message, 72)?;
+        }
+        Ok(())
+    }
+
+    fn draw_status(&self, ctx: &X11Context, rect: Rect, message: &str, error: bool) -> Result<()> {
+        let gc = if error {
+            self.overlay.gcs.text
+        } else {
+            self.overlay.gcs.muted
+        };
+        self.draw_text_with_gc(ctx, gc, rect.x + 8, rect.y + 19, message, 48)
+    }
+
+    fn draw_workspace_badge(
+        &self,
+        ctx: &X11Context,
+        cell: Rect,
+        workspace: &str,
+        focused: bool,
+        urgent: bool,
+    ) -> Result<()> {
+        let width = cell.width.saturating_sub(18).min(136);
+        let rect = Rect {
+            x: cell.x + 9,
+            y: cell.y + 8,
+            width,
+            height: 22,
+        };
+        self.fill(ctx, rect, self.overlay.gcs.badge)?;
+        let marker = if urgent {
+            "! "
+        } else if focused {
+            "* "
+        } else {
+            ""
+        };
+        let label = format!("{marker}{workspace}");
+        self.draw_text(ctx, rect.x + 6, rect.y + 15, &label, 20)
     }
 
     fn draw_label(&self, ctx: &X11Context, cell: Rect, label: &str) -> Result<()> {
-        let y = cell.y.saturating_add(cell.height as i16).saturating_sub(11);
-        self.draw_text(ctx, cell.x + 10, y, label)
+        let y = cell.y.saturating_add(cell.height as i16).saturating_sub(12);
+        let max_chars = (usize::from(cell.width) / 7)
+            .saturating_sub(2)
+            .clamp(12, 120);
+        self.draw_text(ctx, cell.x + 10, y, label, max_chars)
     }
 
     fn draw_border(&self, ctx: &X11Context, rect: Rect, selected: bool) -> Result<()> {
@@ -277,15 +363,39 @@ impl Renderer {
         Ok(())
     }
 
-    fn draw_text(&self, ctx: &X11Context, x: i16, y: i16, text: &str) -> Result<()> {
-        let bytes = ascii_label(text, 96);
+    fn draw_text(&self, ctx: &X11Context, x: i16, y: i16, text: &str, max: usize) -> Result<()> {
+        self.draw_text_with_gc(ctx, self.overlay.gcs.text, x, y, text, max)
+    }
+
+    fn draw_text_with_gc(
+        &self,
+        ctx: &X11Context,
+        gc: Gcontext,
+        x: i16,
+        y: i16,
+        text: &str,
+        max: usize,
+    ) -> Result<()> {
+        let bytes = ascii_label(text, max);
         if bytes.is_empty() {
             return Ok(());
         }
         ctx.conn
-            .image_text8(self.overlay.window, self.overlay.gcs.text, x, y, &bytes)
+            .image_text8(self.overlay.window, gc, x, y, &bytes)
             .context("failed to draw text")?;
         Ok(())
+    }
+}
+
+impl ThumbnailState {
+    fn image(&self) -> Option<&RgbaImage> {
+        match self {
+            Self::Image(image) | Self::Refreshing(Some(image)) => Some(image),
+            Self::Error {
+                image: Some(image), ..
+            } => Some(image),
+            Self::Refreshing(None) | Self::Missing | Self::Error { image: None, .. } => None,
+        }
     }
 }
 
@@ -430,7 +540,11 @@ impl Gcs {
             border: create_gc(ctx, drawable, COLOR_BORDER, COLOR_BORDER, font)?,
             selected: create_gc(ctx, drawable, COLOR_SELECTED, COLOR_SELECTED, font)?,
             text: create_gc(ctx, drawable, COLOR_TEXT, COLOR_BACKGROUND, font)?,
+            muted: create_gc(ctx, drawable, COLOR_MUTED, COLOR_BACKGROUND, font)?,
             error: create_gc(ctx, drawable, COLOR_ERROR, COLOR_ERROR, font)?,
+            empty: create_gc(ctx, drawable, COLOR_EMPTY, COLOR_EMPTY, font)?,
+            badge: create_gc(ctx, drawable, COLOR_BADGE, COLOR_BADGE, font)?,
+            image: create_gc(ctx, drawable, COLOR_TEXT, COLOR_BACKGROUND, font)?,
             font,
         })
     }
@@ -443,7 +557,11 @@ impl Gcs {
             self.border,
             self.selected,
             self.text,
+            self.muted,
             self.error,
+            self.empty,
+            self.badge,
+            self.image,
         ] {
             if let Ok(cookie) = ctx.conn.free_gc(gc) {
                 cookie.ignore_error();
@@ -453,127 +571,6 @@ impl Gcs {
             cookie.ignore_error();
         }
     }
-}
-
-impl ThumbnailSlot {
-    fn create(
-        ctx: &X11Context,
-        formats: &QueryPictFormatsReply,
-        window: &WindowInfo,
-        debug: bool,
-    ) -> Self {
-        match create_thumbnail(ctx, formats, window) {
-            Ok(thumbnail) => Self {
-                window: window.id,
-                redirected: true,
-                state: ThumbnailState::Ready(thumbnail),
-            },
-            Err(error) => {
-                if debug {
-                    eprintln!(
-                        "preview: 0x{:08x} `{}` failed: {error:#}",
-                        window.id, window.name
-                    );
-                }
-                Self {
-                    window: window.id,
-                    redirected: false,
-                    state: ThumbnailState::Error(error.to_string()),
-                }
-            }
-        }
-    }
-}
-
-fn create_thumbnail(
-    ctx: &X11Context,
-    formats: &QueryPictFormatsReply,
-    window: &WindowInfo,
-) -> Result<Thumbnail> {
-    let format = pict_format_for_visual(formats, window.geometry.visual).with_context(|| {
-        format!(
-            "no XRender pict format for visual 0x{:08x}",
-            window.geometry.visual
-        )
-    })?;
-
-    let mut redirected = false;
-    let mut pixmap: Option<Pixmap> = None;
-    let mut picture: Option<Picture> = None;
-
-    let result = (|| {
-        ctx.conn
-            .composite_redirect_window(window.id, Redirect::AUTOMATIC)
-            .context("failed to request XComposite redirect")?
-            .check()
-            .context("XComposite rejected redirect for window")?;
-        redirected = true;
-
-        let pixmap_id = ctx
-            .conn
-            .generate_id()
-            .context("failed to allocate pixmap id")?;
-        pixmap = Some(pixmap_id);
-        ctx.conn
-            .composite_name_window_pixmap(window.id, pixmap_id)
-            .context("failed to request named window pixmap")?
-            .check()
-            .context("XComposite could not name the window pixmap")?;
-
-        let picture_id = ctx
-            .conn
-            .generate_id()
-            .context("failed to allocate picture id")?;
-        picture = Some(picture_id);
-        ctx.conn
-            .render_create_picture(
-                picture_id,
-                pixmap_id,
-                format,
-                &CreatePictureAux::new().subwindowmode(SubwindowMode::INCLUDE_INFERIORS),
-            )
-            .context("failed to create source picture for thumbnail")?
-            .check()
-            .context("XRender rejected source picture for thumbnail")?;
-
-        if let Ok(cookie) = ctx.conn.render_set_picture_filter(picture_id, b"best", &[]) {
-            cookie.ignore_error();
-        }
-
-        Ok(Thumbnail {
-            pixmap: pixmap
-                .take()
-                .expect("pixmap was set before thumbnail success"),
-            picture: picture
-                .take()
-                .expect("picture was set before thumbnail success"),
-            width: window.geometry.width,
-            height: window.geometry.height,
-        })
-    })();
-
-    if result.is_err() {
-        if let Some(picture_id) = picture {
-            if let Ok(cookie) = ctx.conn.render_free_picture(picture_id) {
-                cookie.ignore_error();
-            }
-        }
-        if let Some(pixmap_id) = pixmap {
-            if let Ok(cookie) = ctx.conn.free_pixmap(pixmap_id) {
-                cookie.ignore_error();
-            }
-        }
-        if redirected {
-            if let Ok(cookie) = ctx
-                .conn
-                .composite_unredirect_window(window.id, Redirect::AUTOMATIC)
-            {
-                cookie.ignore_error();
-            }
-        }
-    }
-
-    result
 }
 
 fn set_overlay_identity(ctx: &X11Context, window: Window) -> Result<()> {
@@ -626,7 +623,10 @@ fn create_gc(
     Ok(gc)
 }
 
-fn pict_format_for_visual(formats: &QueryPictFormatsReply, visual: Visualid) -> Option<Pictformat> {
+fn pict_format_for_visual(
+    formats: &QueryPictFormatsReply,
+    visual: x11rb::protocol::xproto::Visualid,
+) -> Option<Pictformat> {
     formats
         .screens
         .iter()
@@ -634,13 +634,6 @@ fn pict_format_for_visual(formats: &QueryPictFormatsReply, visual: Visualid) -> 
         .flat_map(|depth| &depth.visuals)
         .find(|candidate| candidate.visual == visual)
         .map(|candidate| candidate.format)
-}
-
-fn fixed_ratio(source: u16, destination: u16) -> i32 {
-    if destination == 0 {
-        return 1 << 16;
-    }
-    (((source as i64) << 16) / destination as i64) as i32
 }
 
 fn ascii_label(text: &str, max: usize) -> Vec<u8> {
