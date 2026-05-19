@@ -38,8 +38,8 @@ cargo run -- --debug
 
 The first run may take longer because it visits workspaces behind the overlay to
 capture real thumbnails. Later runs paint cached thumbnails from
-`$XDG_CACHE_HOME/tobyscope-x11/` immediately and refresh them while the overlay is
-open.
+`$XDG_CACHE_HOME/tobyscope-x11/` immediately. To avoid visible flashing, cached
+thumbnails are refreshed only when missing or older than roughly 10 minutes.
 
 ## i3 binding
 

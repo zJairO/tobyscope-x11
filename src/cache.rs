@@ -2,12 +2,15 @@ use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use image::{ImageFormat, RgbaImage};
 use serde::{Deserialize, Serialize};
 
 use crate::windows::WindowInfo;
+
+const FRESH_THUMBNAIL_FOR: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug)]
 pub struct ThumbnailCache {
@@ -65,6 +68,20 @@ impl ThumbnailCache {
                 }
                 None
             }
+        }
+    }
+
+    pub fn needs_refresh(&self, window: &WindowInfo) -> bool {
+        let path = self.png_path(window);
+        let Ok(metadata) = fs::metadata(&path) else {
+            return true;
+        };
+        let Ok(modified) = metadata.modified() else {
+            return true;
+        };
+        match modified.elapsed() {
+            Ok(age) => age > FRESH_THUMBNAIL_FOR,
+            Err(_) => false,
         }
     }
 

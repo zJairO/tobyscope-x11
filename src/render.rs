@@ -9,7 +9,7 @@ use x11rb::protocol::render::{
 };
 use x11rb::protocol::xproto::{
     AtomEnum, ConnectionExt as XprotoConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Font,
-    Gcontext, GrabMode, GrabStatus, ImageFormat, PropMode, Rectangle, Window, WindowClass,
+    Gcontext, GrabMode, GrabStatus, ImageFormat, Pixmap, PropMode, Rectangle, Window, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
@@ -38,6 +38,7 @@ pub struct Renderer {
 
 struct Overlay {
     window: Window,
+    buffer: Pixmap,
     picture: Picture,
     gcs: Gcs,
     width: u16,
@@ -117,9 +118,18 @@ impl Renderer {
         (self.overlay.width, self.overlay.height)
     }
 
-    pub fn update_size(&mut self, width: u16, height: u16) {
+    pub fn update_size(&mut self, ctx: &X11Context, width: u16, height: u16) -> Result<()> {
+        if self.overlay.width == width && self.overlay.height == height {
+            return Ok(());
+        }
+        self.overlay.resize_buffer(ctx, width, height)?;
         self.overlay.width = width;
         self.overlay.height = height;
+        Ok(())
+    }
+
+    pub fn raise(&self, ctx: &X11Context) -> Result<()> {
+        self.overlay.raise(ctx)
     }
 
     pub fn set_refreshing(&mut self, index: usize) {
@@ -205,6 +215,21 @@ impl Renderer {
             self.draw_border(ctx, item.cell, index == selected)?;
         }
 
+        ctx.conn
+            .copy_area(
+                self.overlay.buffer,
+                self.overlay.window,
+                self.overlay.gcs.image,
+                0,
+                0,
+                0,
+                0,
+                self.overlay.width,
+                self.overlay.height,
+            )
+            .context("failed to copy back buffer to overlay")?
+            .check()
+            .context("X11 rejected overlay back-buffer copy")?;
         ctx.conn.flush().context("failed to flush redraw")?;
         Ok(())
     }
@@ -229,7 +254,7 @@ impl Renderer {
         ctx.conn
             .put_image(
                 ImageFormat::Z_PIXMAP,
-                self.overlay.window,
+                self.overlay.buffer,
                 self.overlay.gcs.image,
                 rect.width,
                 rect.height,
@@ -350,7 +375,7 @@ impl Renderer {
         }
         ctx.conn
             .poly_fill_rectangle(
-                self.overlay.window,
+                self.overlay.buffer,
                 gc,
                 &[Rectangle {
                     x: rect.x,
@@ -381,7 +406,7 @@ impl Renderer {
             return Ok(());
         }
         ctx.conn
-            .image_text8(self.overlay.window, gc, x, y, &bytes)
+            .image_text8(self.overlay.buffer, gc, x, y, &bytes)
             .context("failed to draw text")?;
         Ok(())
     }
@@ -452,20 +477,15 @@ impl Overlay {
             .check()
             .context("XRender rejected overlay picture")?;
 
-        let gcs = Gcs::create(ctx, window)?;
+        let buffer = create_buffer(ctx, window, ctx.width, ctx.height)?;
+        let gcs = Gcs::create(ctx, buffer)?;
 
         ctx.conn
             .map_window(window)
             .context("failed to map overlay")?
             .check()
             .context("X11 rejected overlay map")?;
-        ctx.conn
-            .configure_window(
-                window,
-                &x11rb::protocol::xproto::ConfigureWindowAux::new()
-                    .stack_mode(x11rb::protocol::xproto::StackMode::ABOVE),
-            )
-            .context("failed to raise overlay")?;
+        raise_window(ctx, window)?;
 
         let grab = ctx
             .conn
@@ -490,6 +510,7 @@ impl Overlay {
 
         Ok(Self {
             window,
+            buffer,
             picture,
             gcs,
             width: ctx.width,
@@ -506,6 +527,19 @@ impl Overlay {
         }
     }
 
+    fn resize_buffer(&mut self, ctx: &X11Context, width: u16, height: u16) -> Result<()> {
+        let next = create_buffer(ctx, self.window, width, height)?;
+        if let Ok(cookie) = ctx.conn.free_pixmap(self.buffer) {
+            cookie.ignore_error();
+        }
+        self.buffer = next;
+        Ok(())
+    }
+
+    fn raise(&self, ctx: &X11Context) -> Result<()> {
+        raise_window(ctx, self.window)
+    }
+
     fn destroy(&self, ctx: &X11Context) -> Result<()> {
         if let Ok(cookie) = ctx.conn.ungrab_keyboard(CURRENT_TIME) {
             cookie.ignore_error();
@@ -514,6 +548,9 @@ impl Overlay {
             cookie.ignore_error();
         }
         self.gcs.destroy(ctx);
+        if let Ok(cookie) = ctx.conn.free_pixmap(self.buffer) {
+            cookie.ignore_error();
+        }
         if let Ok(cookie) = ctx.conn.destroy_window(self.window) {
             cookie.ignore_error();
         }
@@ -522,7 +559,7 @@ impl Overlay {
 }
 
 impl Gcs {
-    fn create(ctx: &X11Context, drawable: Window) -> Result<Self> {
+    fn create(ctx: &X11Context, drawable: Pixmap) -> Result<Self> {
         let font = ctx
             .conn
             .generate_id()
@@ -604,7 +641,7 @@ fn set_overlay_identity(ctx: &X11Context, window: Window) -> Result<()> {
 
 fn create_gc(
     ctx: &X11Context,
-    drawable: Window,
+    drawable: Pixmap,
     foreground: u32,
     background: u32,
     font: Font,
@@ -621,6 +658,38 @@ fn create_gc(
         .check()
         .context("X11 rejected graphics context")?;
     Ok(gc)
+}
+
+fn create_buffer(ctx: &X11Context, drawable: Window, width: u16, height: u16) -> Result<Pixmap> {
+    let buffer = ctx
+        .conn
+        .generate_id()
+        .context("failed to allocate overlay back-buffer id")?;
+    ctx.conn
+        .create_pixmap(
+            ctx.root_depth,
+            buffer,
+            drawable,
+            width.max(1),
+            height.max(1),
+        )
+        .context("failed to create overlay back buffer")?
+        .check()
+        .context("X11 rejected overlay back-buffer creation")?;
+    Ok(buffer)
+}
+
+fn raise_window(ctx: &X11Context, window: Window) -> Result<()> {
+    ctx.conn
+        .configure_window(
+            window,
+            &x11rb::protocol::xproto::ConfigureWindowAux::new()
+                .stack_mode(x11rb::protocol::xproto::StackMode::ABOVE),
+        )
+        .context("failed to raise overlay")?
+        .check()
+        .context("X11 rejected overlay raise")?;
+    Ok(())
 }
 
 fn pict_format_for_visual(

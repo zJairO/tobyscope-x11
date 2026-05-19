@@ -67,7 +67,7 @@ impl OverviewApp {
     }
 
     fn event_loop(&mut self) -> Result<Option<WindowInfo>> {
-        let mut sweep = Some(CaptureSweep::new(&self.windows, self.debug));
+        let mut sweep = Some(CaptureSweep::new(&self.windows, &self.cache, self.debug));
         let mut layout = self.redraw()?;
 
         loop {
@@ -128,7 +128,8 @@ impl OverviewApp {
                 *layout = self.redraw()?;
             }
             Event::ConfigureNotify(event) if event.window == self.renderer.overlay_window() => {
-                self.renderer.update_size(event.width, event.height);
+                self.renderer
+                    .update_size(&self.ctx, event.width, event.height)?;
                 *layout = self.redraw()?;
             }
             Event::KeyPress(event) => {

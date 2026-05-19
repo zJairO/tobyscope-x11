@@ -42,7 +42,7 @@ pub struct CaptureSweep {
 }
 
 impl CaptureSweep {
-    pub fn new(windows: &[WindowInfo], debug: bool) -> Self {
+    pub fn new(windows: &[WindowInfo], cache: &ThumbnailCache, debug: bool) -> Self {
         let original_workspace = match i3::current_workspace() {
             Ok(workspace) => workspace,
             Err(error) => {
@@ -55,11 +55,15 @@ impl CaptureSweep {
         let tasks = windows
             .iter()
             .enumerate()
+            .filter(|(_, window)| cache.needs_refresh(window))
             .map(|(index, window)| CaptureTask {
                 index,
                 workspace: window.workspace.clone(),
             })
-            .collect();
+            .collect::<VecDeque<_>>();
+        if debug {
+            eprintln!("capture: queued {} missing/stale thumbnails", tasks.len());
+        }
 
         Self {
             tasks,
@@ -89,6 +93,7 @@ impl CaptureSweep {
                 .with_context(|| format!("failed to switch to workspace {}", task.workspace))?;
             self.active_workspace = Some(task.workspace.clone());
             thread::sleep(WORKSPACE_SETTLE);
+            renderer.raise(ctx)?;
         }
 
         let Some(window) = windows.get(task.index) else {
