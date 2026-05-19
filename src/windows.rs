@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::thread;
+use std::time::Duration;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     AtomEnum, CLIENT_MESSAGE_EVENT, ClientMessageData, ClientMessageEvent, ConfigureWindowAux,
@@ -117,9 +119,12 @@ pub fn focus_window(
     window: &WindowInfo,
     debug: bool,
 ) -> Result<()> {
+    let mut i3_focus_succeeded = false;
     if let Some(con_id) = window.i3_con_id {
         match crate::i3::focus_con(con_id, &window.workspace, debug) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                i3_focus_succeeded = true;
+            }
             Err(error) if debug => {
                 eprintln!(
                     "focus: i3 focus for workspace={} con_id={con_id} failed, falling back to EWMH: {error:#}",
@@ -133,6 +138,9 @@ pub fn focus_window(
     let id = window.id;
     if debug {
         eprintln!("focus: requesting _NET_ACTIVE_WINDOW for 0x{id:08x}");
+    }
+    if i3_focus_succeeded {
+        thread::sleep(Duration::from_millis(40));
     }
 
     let event = ClientMessageEvent {

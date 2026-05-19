@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use i3ipc::I3Connection;
@@ -79,14 +81,29 @@ pub fn switch_workspace(name: &str, debug: bool) -> Result<()> {
 }
 
 pub fn focus_con(con_id: i64, workspace: &str, debug: bool) -> Result<()> {
-    let command = format!(
-        "workspace \"{}\"; [con_id={con_id}] focus",
-        escape_i3_string(workspace)
-    );
+    let workspace_command = format!("workspace \"{}\"", escape_i3_string(workspace));
+    if debug {
+        eprintln!("i3: {workspace_command}");
+    }
+    run_checked_command(&workspace_command)?;
+    thread::sleep(Duration::from_millis(60));
+
+    let command = format!("[con_id={con_id}] focus");
     if debug {
         eprintln!("i3: {command}");
     }
-    run_checked_command(&command)
+    run_checked_command(&command)?;
+    thread::sleep(Duration::from_millis(40));
+    if debug {
+        match current_workspace() {
+            Ok(Some(current)) => {
+                eprintln!("i3: focused workspace after focus command is {current}")
+            }
+            Ok(None) => eprintln!("i3: no focused workspace reported after focus command"),
+            Err(error) => eprintln!("i3: failed to verify focused workspace: {error:#}"),
+        }
+    }
+    Ok(())
 }
 
 fn run_checked_command(command: &str) -> Result<()> {
