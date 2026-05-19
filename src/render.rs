@@ -6,9 +6,11 @@ use x11rb::protocol::render::{
     QueryPictFormatsReply, Transform,
 };
 use x11rb::protocol::xproto::{
-    ConnectionExt as XprotoConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Font, Gcontext,
-    GrabMode, GrabStatus, Pixmap, Rectangle, SubwindowMode, Visualid, Window, WindowClass,
+    AtomEnum, ConnectionExt as XprotoConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Font,
+    Gcontext, GrabMode, GrabStatus, Pixmap, PropMode, Rectangle, SubwindowMode, Visualid, Window,
+    WindowClass,
 };
+use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::{CURRENT_TIME, NONE};
 
 use crate::layout::{Layout, Rect};
@@ -22,6 +24,7 @@ const COLOR_BORDER: u32 = 0x5f6f7f;
 const COLOR_SELECTED: u32 = 0x4ea1ff;
 const COLOR_TEXT: u32 = 0xe8edf2;
 const COLOR_ERROR: u32 = 0x66303a;
+const APP_ID: &str = "tobyscope-x11";
 
 pub struct Renderer {
     overlay: Overlay,
@@ -327,6 +330,7 @@ impl Overlay {
             .context("failed to create overlay window")?
             .check()
             .context("X11 rejected overlay window creation")?;
+        set_overlay_identity(ctx, window)?;
 
         let picture = ctx
             .conn
@@ -570,6 +574,35 @@ fn create_thumbnail(
     }
 
     result
+}
+
+fn set_overlay_identity(ctx: &X11Context, window: Window) -> Result<()> {
+    let wm_class = b"tobyscope-x11\0tobyscope-x11\0";
+    ctx.conn
+        .change_property8(
+            PropMode::REPLACE,
+            window,
+            AtomEnum::WM_CLASS,
+            AtomEnum::STRING,
+            wm_class,
+        )
+        .context("failed to set overlay WM_CLASS")?
+        .check()
+        .context("X11 rejected overlay WM_CLASS")?;
+
+    ctx.conn
+        .change_property8(
+            PropMode::REPLACE,
+            window,
+            AtomEnum::WM_NAME,
+            AtomEnum::STRING,
+            APP_ID.as_bytes(),
+        )
+        .context("failed to set overlay WM_NAME")?
+        .check()
+        .context("X11 rejected overlay WM_NAME")?;
+
+    Ok(())
 }
 
 fn create_gc(

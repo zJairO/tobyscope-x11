@@ -63,4 +63,5 @@ i3-msg reload
 - `DISPLAY is not set`: run inside an X11 session. Wayland-only sessions are not supported.
 - Missing `Composite` or `Render`: the current X server does not expose the required X11 extensions.
 - Per-window `preview error`: the server rejected the XComposite/XRender path for that window. Run with `--debug` to see the exact X11 error.
+- For picom rules, the overlay sets `WM_CLASS` to `tobyscope-x11`; use `class_g = 'tobyscope-x11'` to exclude shadows, rounded corners, blur, or fading.
 - Docker is intended for compilation checks. Full runtime testing from Docker requires access to the host X socket and matching `DISPLAY`, for example with `/tmp/.X11-unix` mounted and appropriate `xhost` permissions.
