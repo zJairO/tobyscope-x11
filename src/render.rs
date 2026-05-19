@@ -12,8 +12,9 @@ use x11rb::protocol::render::{
     QueryPictFormatsReply,
 };
 use x11rb::protocol::xproto::{
-    AtomEnum, ConnectionExt as XprotoConnectionExt, CreateGCAux, CreateWindowAux, EventMask, Font,
-    Gcontext, GrabMode, GrabStatus, ImageFormat, Pixmap, PropMode, Rectangle, Window, WindowClass,
+    AtomEnum, ConfigureWindowAux, ConnectionExt as XprotoConnectionExt, CreateGCAux,
+    CreateWindowAux, EventMask, Font, Gcontext, GrabMode, GrabStatus, ImageFormat, Pixmap,
+    PropMode, Rectangle, Window, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::{CURRENT_TIME, NONE};
@@ -43,6 +44,7 @@ struct Overlay {
     gcs: Gcs,
     width: u16,
     height: u16,
+    visible: bool,
 }
 
 struct Gcs {
@@ -176,11 +178,20 @@ impl Renderer {
         (self.overlay.width, self.overlay.height)
     }
 
+    pub fn sync_root_size(&mut self, ctx: &X11Context) -> Result<bool> {
+        let (width, height) = ctx.root_size()?;
+        if self.overlay.width == width && self.overlay.height == height {
+            return Ok(false);
+        }
+        self.update_size(ctx, width, height)?;
+        Ok(true)
+    }
+
     pub fn update_size(&mut self, ctx: &X11Context, width: u16, height: u16) -> Result<()> {
         if self.overlay.width == width && self.overlay.height == height {
             return Ok(());
         }
-        self.overlay.resize_buffer(ctx, width, height)?;
+        self.overlay.resize(ctx, width, height)?;
         self.overlay.width = width;
         self.overlay.height = height;
         Ok(())
@@ -188,6 +199,40 @@ impl Renderer {
 
     pub fn raise(&self, ctx: &X11Context) -> Result<()> {
         self.overlay.raise(ctx)
+    }
+
+    pub fn show(&mut self, ctx: &X11Context) -> Result<()> {
+        self.overlay.show(ctx)
+    }
+
+    pub fn hide(&mut self, ctx: &X11Context) -> Result<()> {
+        self.overlay.hide(ctx)
+    }
+
+    pub fn present(&self, ctx: &X11Context, layout: &Layout) -> Result<()> {
+        if self.config.ui.show_overlay_background {
+            ctx.conn
+                .copy_area(
+                    self.overlay.buffer,
+                    self.overlay.window,
+                    self.overlay.gcs.image,
+                    0,
+                    0,
+                    0,
+                    0,
+                    self.overlay.width,
+                    self.overlay.height,
+                )
+                .context("failed to copy prepared back buffer to overlay")?
+                .check()
+                .context("X11 rejected prepared overlay copy")?;
+        } else {
+            for item in &layout.items {
+                self.copy_card_to_overlay(ctx, self.card_paint_bounds(item.cell))?;
+            }
+        }
+        ctx.conn.flush().context("failed to flush prepared frame")?;
+        Ok(())
     }
 
     pub fn set_refreshing(&mut self, index: usize) {
@@ -286,29 +331,7 @@ impl Renderer {
             }
         }
 
-        if self.config.ui.show_overlay_background {
-            ctx.conn
-                .copy_area(
-                    self.overlay.buffer,
-                    self.overlay.window,
-                    self.overlay.gcs.image,
-                    0,
-                    0,
-                    0,
-                    0,
-                    self.overlay.width,
-                    self.overlay.height,
-                )
-                .context("failed to copy back buffer to overlay")?
-                .check()
-                .context("X11 rejected overlay back-buffer copy")?;
-        } else {
-            for item in &layout.items {
-                self.copy_card_to_overlay(ctx, self.card_paint_bounds(item.cell))?;
-            }
-        }
-        ctx.conn.flush().context("failed to flush redraw")?;
-        Ok(())
+        self.present(ctx, layout)
     }
 
     pub fn cleanup(&mut self, ctx: &X11Context) -> Result<()> {
@@ -1047,6 +1070,7 @@ impl Overlay {
             .event_mask(
                 EventMask::EXPOSURE
                     | EventMask::KEY_PRESS
+                    | EventMask::KEY_RELEASE
                     | EventMask::BUTTON_PRESS
                     | EventMask::POINTER_MOTION
                     | EventMask::STRUCTURE_NOTIFY,
@@ -1089,18 +1113,69 @@ impl Overlay {
         let buffer = create_buffer(ctx, window, ctx.width, ctx.height)?;
         let gcs = Gcs::create(ctx, buffer, &config.colors, &config.ui.font)?;
 
+        ctx.conn.flush().context("failed to flush overlay setup")?;
+
+        Ok(Self {
+            window,
+            buffer,
+            picture,
+            gcs,
+            width: ctx.width,
+            height: ctx.height,
+            visible: false,
+        })
+    }
+
+    fn rect(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    fn resize(&mut self, ctx: &X11Context, width: u16, height: u16) -> Result<()> {
+        let next = create_buffer(ctx, self.window, width, height)?;
         ctx.conn
-            .map_window(window)
-            .context("failed to map overlay")?
+            .configure_window(
+                self.window,
+                &ConfigureWindowAux::new()
+                    .x(0)
+                    .y(0)
+                    .width(u32::from(width.max(1)))
+                    .height(u32::from(height.max(1))),
+            )
+            .context("failed to resize overlay window")?
             .check()
-            .context("X11 rejected overlay map")?;
-        raise_window(ctx, window)?;
+            .context("X11 rejected overlay window resize")?;
+        if let Ok(cookie) = ctx.conn.free_pixmap(self.buffer) {
+            cookie.ignore_error();
+        }
+        self.buffer = next;
+        Ok(())
+    }
+
+    fn raise(&self, ctx: &X11Context) -> Result<()> {
+        raise_window(ctx, self.window)
+    }
+
+    fn show(&mut self, ctx: &X11Context) -> Result<()> {
+        if !self.visible {
+            ctx.conn
+                .map_window(self.window)
+                .context("failed to map overlay")?
+                .check()
+                .context("X11 rejected overlay map")?;
+            self.visible = true;
+        }
+        raise_window(ctx, self.window)?;
 
         let grab = ctx
             .conn
             .grab_keyboard(
                 false,
-                window,
+                self.window,
                 CURRENT_TIME,
                 GrabMode::ASYNC,
                 GrabMode::ASYNC,
@@ -1119,7 +1194,7 @@ impl Overlay {
             .conn
             .grab_pointer(
                 false,
-                window,
+                self.window,
                 EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
                 GrabMode::ASYNC,
                 GrabMode::ASYNC,
@@ -1131,53 +1206,38 @@ impl Overlay {
             .reply()
             .context("failed to receive pointer grab reply")?;
         if pointer_grab.status != GrabStatus::SUCCESS {
+            if let Ok(cookie) = ctx.conn.ungrab_keyboard(CURRENT_TIME) {
+                cookie.ignore_error();
+            }
             bail!(
                 "could not grab pointer for overview overlay: {:?}",
                 pointer_grab.status
             );
         }
 
-        ctx.conn.flush().context("failed to flush overlay setup")?;
-
-        Ok(Self {
-            window,
-            buffer,
-            picture,
-            gcs,
-            width: ctx.width,
-            height: ctx.height,
-        })
-    }
-
-    fn rect(&self) -> Rect {
-        Rect {
-            x: 0,
-            y: 0,
-            width: self.width,
-            height: self.height,
-        }
-    }
-
-    fn resize_buffer(&mut self, ctx: &X11Context, width: u16, height: u16) -> Result<()> {
-        let next = create_buffer(ctx, self.window, width, height)?;
-        if let Ok(cookie) = ctx.conn.free_pixmap(self.buffer) {
-            cookie.ignore_error();
-        }
-        self.buffer = next;
+        ctx.conn.flush().context("failed to flush overlay show")?;
         Ok(())
     }
 
-    fn raise(&self, ctx: &X11Context) -> Result<()> {
-        raise_window(ctx, self.window)
-    }
-
-    fn destroy(&self, ctx: &X11Context) -> Result<()> {
+    fn hide(&mut self, ctx: &X11Context) -> Result<()> {
         if let Ok(cookie) = ctx.conn.ungrab_keyboard(CURRENT_TIME) {
             cookie.ignore_error();
         }
         if let Ok(cookie) = ctx.conn.ungrab_pointer(CURRENT_TIME) {
             cookie.ignore_error();
         }
+        if self.visible {
+            if let Ok(cookie) = ctx.conn.unmap_window(self.window) {
+                cookie.ignore_error();
+            }
+            self.visible = false;
+        }
+        ctx.conn.flush().context("failed to flush overlay hide")?;
+        Ok(())
+    }
+
+    fn destroy(&mut self, ctx: &X11Context) -> Result<()> {
+        self.hide(ctx)?;
         if let Ok(cookie) = ctx.conn.render_free_picture(self.picture) {
             cookie.ignore_error();
         }

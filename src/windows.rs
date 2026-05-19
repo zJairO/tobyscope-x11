@@ -125,6 +125,24 @@ pub fn print_window_list(windows: &[WindowInfo]) {
     }
 }
 
+pub fn model_key(windows: &[WindowInfo]) -> Vec<String> {
+    windows
+        .iter()
+        .map(|window| {
+            format!(
+                "{}:{:?}:{}:{}:{}:{}:{}",
+                window.id,
+                window.i3_con_id,
+                window.workspace,
+                window.tree_order,
+                window.urgent,
+                window.class.as_deref().unwrap_or(""),
+                window.instance.as_deref().unwrap_or("")
+            )
+        })
+        .collect()
+}
+
 fn normalize_program_name(value: &str) -> Cow<'_, str> {
     let trimmed = value.trim();
     if trimmed.is_empty() {

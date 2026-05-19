@@ -4,6 +4,7 @@ mod cache;
 mod capture;
 mod cli;
 mod config;
+mod daemon;
 mod i3;
 mod input;
 mod layout;
@@ -16,6 +17,29 @@ use anyhow::Result;
 
 fn main() -> Result<()> {
     let args = cli::Args::parse()?;
+
+    match args.mode {
+        cli::RunMode::Daemon => return daemon::run(&args),
+        cli::RunMode::DaemonStatus => {
+            return daemon::send_command("status", args.debug, true);
+        }
+        cli::RunMode::DaemonQuit => {
+            return daemon::send_command("quit", args.debug, true);
+        }
+        cli::RunMode::Auto if !args.list_windows => match daemon::send_show_command(args.debug) {
+            Ok(()) => return Ok(()),
+            Err(error) if args.debug => {
+                eprintln!("daemon: unavailable, falling back to standalone: {error:#}");
+            }
+            Err(_) => {}
+        },
+        cli::RunMode::Auto | cli::RunMode::Standalone => {}
+    }
+
+    run_standalone(&args)
+}
+
+fn run_standalone(args: &cli::Args) -> Result<()> {
     let config = config::load(args.config_path.as_deref(), args.debug)?.config;
     let ctx = x11::X11Context::connect(args.debug)?;
     ctx.require_extensions(args.debug)?;

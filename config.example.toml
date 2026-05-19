@@ -31,5 +31,10 @@ top_meta_height = 40
 label_height = 34
 
 [thumbnails]
-refresh_after_seconds = 600
+refresh_after_seconds = 60
 max_cache_edge = 960
+
+[daemon]
+background_current_workspace_refresh = true
+idle_refresh_ms = 750
+stale_show_ms = 250

@@ -66,6 +66,16 @@ impl X11Context {
 
         Ok(())
     }
+
+    pub fn root_size(&self) -> Result<(u16, u16)> {
+        let geometry = self
+            .conn
+            .get_geometry(self.root)
+            .context("failed to request root window geometry")?
+            .reply()
+            .context("failed to read root window geometry")?;
+        Ok((geometry.width, geometry.height))
+    }
 }
 
 fn require_extension(conn: &RustConnection, name: &'static str) -> Result<()> {

@@ -14,7 +14,7 @@ The repository and release must be public for these URLs to work without GitHub
 permissions.
 
 ```bash
-version=v0.1.1
+version=v0.2.0
 curl -LO "https://github.com/zJairO/tobyscope-x11/releases/download/${version}/tobyscope-x11-linux-x86_64.tar.gz"
 curl -LO "https://github.com/zJairO/tobyscope-x11/releases/download/${version}/SHA256SUMS"
 sha256sum -c SHA256SUMS
@@ -65,14 +65,25 @@ happen natively on the host X11/i3 session.
 ```bash
 tobyscope-x11
 tobyscope-x11 --debug
+tobyscope-x11 --daemon --debug
+tobyscope-x11 --daemon-status
+tobyscope-x11 --daemon-quit
+tobyscope-x11 --standalone --debug
 tobyscope-x11 --list-windows --debug
 tobyscope-x11 --config ~/.config/tobyscope-x11/config.toml
 ```
 
-The first run may take longer because it visits workspaces behind the overlay to
-capture real thumbnails. Later runs paint cached thumbnails from
-`$XDG_CACHE_HOME/tobyscope-x11/` immediately. By default, cached thumbnails are
-refreshed when missing or older than 10 minutes.
+For the fastest startup, run `tobyscope-x11 --daemon` once in the i3 session.
+After that, plain `tobyscope-x11` is a tiny client: it sends `show` to the
+daemon through `$XDG_RUNTIME_DIR/tobyscope-x11/socket` and exits. If the daemon
+is not reachable, plain `tobyscope-x11` falls back to the standalone overview.
+
+The daemon keeps the X11 connection, config, cached PNGs, prepared pixmaps, and
+text rendering cache warm. Cached thumbnails from `$XDG_CACHE_HOME/tobyscope-x11/`
+are shown immediately, even if they are old; missing or stale thumbnails refresh
+in the background. The current workspace can refresh while the overlay is hidden;
+other workspaces refresh while the overlay is open, so i3 workspace switches stay
+covered.
 
 Controls:
 
@@ -80,14 +91,23 @@ Controls:
 - Enter: focus the selected window.
 - Mouse hover: select a window.
 - Left click: focus the clicked window.
-- Escape: close without changing focus.
+- Escape or the Super/Windows key: close without changing focus.
 
 ## i3 Binding
 
 Add this to your i3 config:
 
 ```i3
+exec_always --no-startup-id tobyscope-x11 --daemon
 bindsym $mod+space exec --no-startup-id tobyscope-x11
+```
+
+If you use a single Super/Windows key as the launcher, bind the keycode release
+instead:
+
+```i3
+exec_always --no-startup-id /home/zjairo/.local/bin/tobyscope-x11 --daemon
+bindcode --release 133 exec --no-startup-id /home/zjairo/.local/bin/tobyscope-x11
 ```
 
 Then reload i3:
@@ -152,8 +172,13 @@ top_meta_height = 40
 label_height = 34
 
 [thumbnails]
-refresh_after_seconds = 600
+refresh_after_seconds = 60
 max_cache_edge = 960
+
+[daemon]
+background_current_workspace_refresh = true
+idle_refresh_ms = 750
+stale_show_ms = 250
 ```
 
 Notes:
@@ -177,6 +202,12 @@ Notes:
 - `shadows = true` draws internal shadows behind overview cards for setups that
   use picom shadows. `shadow_offset_x`, `shadow_offset_y`, `shadow_radius`, and
   `colors.shadow` control the look.
+- `background_current_workspace_refresh = true` lets the daemon refresh stale
+  thumbnails for the currently focused workspace while the overview is hidden.
+- `idle_refresh_ms` controls how often the daemon checks config/state while it is
+  idle.
+- `stale_show_ms` drops old queued show requests after the overview closes, which
+  prevents Super/Windows key release from reopening it.
 
 ## picom
 
@@ -208,8 +239,8 @@ To publish a release:
 git status --short
 cargo check
 cargo build --release --locked
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 The GitHub Actions release workflow builds the Linux x86_64 tarball, creates
@@ -224,6 +255,10 @@ The GitHub Actions release workflow builds the Linux x86_64 tarball, creates
 - `--list-windows --debug` should list windows from all i3 workspaces. If i3 IPC
   is unavailable, the program falls back to currently visible X11 clients and
   prints a warning in debug mode.
+- `--daemon-status` should print `ok windows=<n> cache=warm` when the resident
+  daemon is running. Newer versions also include whether the overlay is visible.
+- If plain `tobyscope-x11 --debug` says the daemon is unavailable, either start
+  `tobyscope-x11 --daemon` or use `tobyscope-x11 --standalone`.
 - Per-window `preview error`: the server rejected the XComposite/GetImage path
   for that window. Run with `--debug` to see the exact X11 error.
 - Invalid config files fail fast with the config path and the TOML field that

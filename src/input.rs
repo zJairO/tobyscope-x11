@@ -10,6 +10,8 @@ const XK_LEFT: Keysym = 0xff51;
 const XK_UP: Keysym = 0xff52;
 const XK_RIGHT: Keysym = 0xff53;
 const XK_DOWN: Keysym = 0xff54;
+const XK_SUPER_L: Keysym = 0xffeb;
+const XK_SUPER_R: Keysym = 0xffec;
 const XK_H: Keysym = b'h' as Keysym;
 const XK_J: Keysym = b'j' as Keysym;
 const XK_K: Keysym = b'k' as Keysym;
@@ -72,6 +74,12 @@ impl KeyMap {
             return Some(KeyAction::Down);
         }
         None
+    }
+
+    pub fn is_super_keycode(&self, keycode: Keycode) -> bool {
+        self.keysyms_for_keycode(keycode)
+            .map(|keysyms| keysyms.contains(&XK_SUPER_L) || keysyms.contains(&XK_SUPER_R))
+            .unwrap_or(false)
     }
 
     fn keysyms_for_keycode(&self, keycode: Keycode) -> Option<&[Keysym]> {

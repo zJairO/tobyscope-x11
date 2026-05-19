@@ -5,7 +5,7 @@ use x11rb::protocol::xproto::ButtonIndex;
 
 use crate::atoms::Atoms;
 use crate::cache::ThumbnailCache;
-use crate::capture::{CaptureSweep, SweepStatus};
+use crate::capture::{CaptureScope, CaptureSweep, SweepStatus};
 use crate::config::AppConfig;
 use crate::input::{KeyAction, KeyMap};
 use crate::layout::{self, Layout};
@@ -22,7 +22,17 @@ pub struct OverviewApp {
     renderer: Renderer,
     keymap: KeyMap,
     selected: usize,
+    layout: Option<Layout>,
+    sweep: Option<CaptureSweep>,
+    visible: bool,
     debug: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppTick {
+    Idle,
+    Closed,
+    Focused,
 }
 
 impl OverviewApp {
@@ -50,22 +60,32 @@ impl OverviewApp {
             renderer,
             keymap,
             selected: 0,
+            layout: None,
+            sweep: None,
+            visible: false,
             debug,
         })
     }
 
     pub fn run(mut self) -> Result<()> {
+        let result = self.show_once();
+        let cleanup = self.cleanup();
+        result?;
+        cleanup
+    }
+
+    pub fn show_once(&mut self) -> Result<()> {
         let result = self.event_loop();
-        let cleanup = self.renderer.cleanup(&self.ctx);
+        let hide = self.renderer.hide(&self.ctx);
 
         let target = match result {
             Ok(target) => target,
             Err(error) => {
-                cleanup?;
+                hide?;
                 return Err(error);
             }
         };
-        cleanup?;
+        hide?;
 
         if let Some(window) = target {
             windows::focus_window(&self.ctx, &self.atoms, &window, self.debug)?;
@@ -74,13 +94,105 @@ impl OverviewApp {
         Ok(())
     }
 
+    pub fn prewarm(&mut self) -> Result<()> {
+        self.prepare_frame()
+    }
+
+    pub fn cleanup(&mut self) -> Result<()> {
+        self.renderer.cleanup(&self.ctx)
+    }
+
+    pub fn window_count(&self) -> usize {
+        self.windows.len()
+    }
+
+    pub fn show_prepared(&mut self) -> Result<()> {
+        let resized = self.renderer.sync_root_size(&self.ctx)?;
+        if resized || self.layout.is_none() {
+            self.prepare_frame()?;
+        }
+        self.renderer.show(&self.ctx)?;
+        self.visible = true;
+        if let Some(layout) = self.layout.as_ref() {
+            self.renderer.present(&self.ctx, layout)?;
+        }
+        self.start_capture(CaptureScope::AllWorkspaces);
+        Ok(())
+    }
+
+    pub fn start_background_capture(&mut self) {
+        if !self.visible && self.sweep.is_none() {
+            self.start_capture(CaptureScope::CurrentWorkspaceOnly);
+        }
+    }
+
+    pub fn tick_nonblocking(&mut self) -> Result<AppTick> {
+        while let Some(event) = self
+            .ctx
+            .conn
+            .poll_for_event()
+            .context("failed while polling for X11 event")?
+        {
+            let mut layout = self.current_layout()?;
+            if let Some(result) = self.handle_event(event, &mut layout)? {
+                self.layout = Some(layout);
+                return self.finish_interaction(result);
+            }
+            self.layout = Some(layout);
+        }
+
+        if let Some(active_sweep) = self.sweep.as_mut() {
+            match active_sweep.step(&self.ctx, &self.cache, &self.windows, &mut self.renderer)? {
+                SweepStatus::Updated => {
+                    self.prepare_frame()?;
+                }
+                SweepStatus::Finished => {
+                    self.sweep = None;
+                    if self.visible {
+                        self.prepare_frame()?;
+                    }
+                }
+            }
+        }
+
+        Ok(AppTick::Idle)
+    }
+
+    pub fn tick_background(&mut self) -> Result<()> {
+        if let Some(active_sweep) = self.sweep.as_mut() {
+            match active_sweep.step(&self.ctx, &self.cache, &self.windows, &mut self.renderer)? {
+                SweepStatus::Updated => {
+                    self.prepare_frame()?;
+                }
+                SweepStatus::Finished => {
+                    self.sweep = None;
+                    self.prepare_frame()?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn hide_without_focus(&mut self) -> Result<()> {
+        if let Some(sweep) = self.sweep.as_mut() {
+            sweep.cancel();
+        }
+        self.sweep = None;
+        self.visible = false;
+        self.renderer.hide(&self.ctx)
+    }
+
     fn event_loop(&mut self) -> Result<Option<WindowInfo>> {
         let mut sweep = Some(CaptureSweep::new(
             &self.windows,
             &self.cache,
             self.config.thumbnails.max_cache_edge,
             self.debug,
+            CaptureScope::AllWorkspaces,
         ));
+        self.redraw()?;
+        self.renderer.show(&self.ctx)?;
         let mut layout = self.redraw()?;
 
         loop {
@@ -175,6 +287,11 @@ impl OverviewApp {
                     *layout = self.redraw()?;
                 }
             }
+            Event::KeyRelease(event) => {
+                if self.keymap.is_super_keycode(event.detail) {
+                    return Ok(Some(None));
+                }
+            }
             Event::MotionNotify(event) => {
                 if let Some(index) = layout::hit_test(layout, event.event_x, event.event_y) {
                     if index != self.selected {
@@ -220,6 +337,49 @@ impl OverviewApp {
         self.renderer
             .redraw(&self.ctx, &self.windows, &layout, self.selected)?;
         Ok(layout)
+    }
+
+    fn prepare_frame(&mut self) -> Result<()> {
+        let layout = self.redraw()?;
+        self.layout = Some(layout);
+        Ok(())
+    }
+
+    fn current_layout(&mut self) -> Result<Layout> {
+        if let Some(layout) = self.layout.clone() {
+            Ok(layout)
+        } else {
+            self.redraw()
+        }
+    }
+
+    fn start_capture(&mut self, scope: CaptureScope) {
+        let sweep = CaptureSweep::new(
+            &self.windows,
+            &self.cache,
+            self.config.thumbnails.max_cache_edge,
+            self.debug,
+            scope,
+        );
+        self.sweep = (!sweep.is_empty()).then_some(sweep);
+    }
+
+    fn finish_interaction(&mut self, result: Option<WindowInfo>) -> Result<AppTick> {
+        if result.is_none() {
+            if self.debug {
+                eprintln!("overview: closing without focus");
+            }
+            self.hide_without_focus()?;
+            return Ok(AppTick::Closed);
+        }
+
+        self.sweep = None;
+        self.visible = false;
+        self.renderer.hide(&self.ctx)?;
+        if let Some(window) = result {
+            windows::focus_window(&self.ctx, &self.atoms, &window, self.debug)?;
+        }
+        Ok(AppTick::Focused)
     }
 
     fn move_left(&mut self, layout: &layout::Layout) {

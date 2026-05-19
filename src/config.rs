@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub colors: ColorConfig,
     pub layout: LayoutConfig,
     pub thumbnails: ThumbnailConfig,
+    pub daemon: DaemonConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +57,13 @@ pub struct ThumbnailConfig {
     pub max_cache_edge: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DaemonConfig {
+    pub background_current_workspace_refresh: bool,
+    pub idle_refresh_ms: u64,
+    pub stale_show_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
     pub config: AppConfig,
@@ -75,6 +83,7 @@ struct RawConfig {
     colors: Option<RawColorConfig>,
     layout: Option<RawLayoutConfig>,
     thumbnails: Option<RawThumbnailConfig>,
+    daemon: Option<RawDaemonConfig>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -123,6 +132,14 @@ struct RawLayoutConfig {
 struct RawThumbnailConfig {
     refresh_after_seconds: Option<u64>,
     max_cache_edge: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawDaemonConfig {
+    background_current_workspace_refresh: Option<bool>,
+    idle_refresh_ms: Option<u64>,
+    stale_show_ms: Option<u64>,
 }
 
 impl AppConfig {
@@ -238,6 +255,24 @@ impl AppConfig {
             }
         }
 
+        if let Some(daemon) = raw.daemon {
+            if let Some(value) = daemon.background_current_workspace_refresh {
+                config.daemon.background_current_workspace_refresh = value;
+            }
+            if let Some(value) = daemon.idle_refresh_ms {
+                if value == 0 {
+                    bail!("daemon.idle_refresh_ms must be at least 1");
+                }
+                config.daemon.idle_refresh_ms = value;
+            }
+            if let Some(value) = daemon.stale_show_ms {
+                if value == 0 {
+                    bail!("daemon.stale_show_ms must be at least 1");
+                }
+                config.daemon.stale_show_ms = value;
+            }
+        }
+
         Ok(config)
     }
 }
@@ -278,8 +313,13 @@ impl Default for AppConfig {
                 label_height: 34,
             },
             thumbnails: ThumbnailConfig {
-                refresh_after_seconds: 600,
+                refresh_after_seconds: 60,
                 max_cache_edge: 960,
+            },
+            daemon: DaemonConfig {
+                background_current_workspace_refresh: true,
+                idle_refresh_ms: 750,
+                stale_show_ms: 250,
             },
         }
     }

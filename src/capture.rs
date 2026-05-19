@@ -18,12 +18,18 @@ use crate::x11::X11Context;
 
 const VIEWABLE_TIMEOUT: Duration = Duration::from_millis(1200);
 const VIEWABLE_POLL: Duration = Duration::from_millis(35);
-const WORKSPACE_SETTLE: Duration = Duration::from_millis(90);
+const WORKSPACE_SETTLE: Duration = Duration::from_millis(160);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepStatus {
     Updated,
     Finished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureScope {
+    CurrentWorkspaceOnly,
+    AllWorkspaces,
 }
 
 #[derive(Debug)]
@@ -47,6 +53,7 @@ impl CaptureSweep {
         cache: &ThumbnailCache,
         max_cache_edge: u32,
         debug: bool,
+        scope: CaptureScope,
     ) -> Self {
         let original_workspace = match i3::current_workspace() {
             Ok(workspace) => workspace,
@@ -57,16 +64,31 @@ impl CaptureSweep {
                 None
             }
         };
-        let tasks = windows
+        let mut tasks = windows
             .iter()
             .enumerate()
-            .filter(|(_, window)| cache.needs_refresh(window))
+            .filter(|(_, window)| {
+                if !cache.needs_refresh(window) {
+                    return false;
+                }
+                match (scope, original_workspace.as_deref()) {
+                    (CaptureScope::AllWorkspaces, _) => true,
+                    (CaptureScope::CurrentWorkspaceOnly, Some(workspace)) => {
+                        window.workspace == workspace
+                    }
+                    (CaptureScope::CurrentWorkspaceOnly, None) => false,
+                }
+            })
             .map(|(index, window)| CaptureTask {
                 index,
                 workspace: window.workspace.clone(),
             })
-            .collect::<VecDeque<_>>();
-        if debug {
+            .collect::<Vec<_>>();
+        if let Some(original_workspace) = original_workspace.as_deref() {
+            tasks.sort_by_key(|task| task.workspace != original_workspace);
+        }
+        let tasks: VecDeque<_> = tasks.into();
+        if debug && !tasks.is_empty() {
             eprintln!("capture: queued {} missing/stale thumbnails", tasks.len());
         }
 
@@ -78,6 +100,10 @@ impl CaptureSweep {
             max_cache_edge,
             debug,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
     }
 
     pub fn step(
@@ -179,6 +205,15 @@ pub fn capture_window(
             .context("failed to request named window pixmap")?
             .check()
             .context("XComposite could not name window pixmap")?;
+        let pixmap_geometry = ctx
+            .conn
+            .get_geometry(pixmap_id)
+            .context("failed to request named pixmap geometry")?
+            .reply()
+            .context("failed to read named pixmap geometry")?;
+        if pixmap_geometry.width == 0 || pixmap_geometry.height == 0 {
+            bail!("named window pixmap has empty geometry");
+        }
 
         let image = ctx
             .conn
@@ -187,8 +222,8 @@ pub fn capture_window(
                 pixmap_id,
                 0,
                 0,
-                geometry.width,
-                geometry.height,
+                pixmap_geometry.width,
+                pixmap_geometry.height,
                 u32::MAX,
             )
             .context("failed to request XImage")?
@@ -203,8 +238,8 @@ pub fn capture_window(
             ctx,
             visual,
             image.depth,
-            geometry.width,
-            geometry.height,
+            pixmap_geometry.width,
+            pixmap_geometry.height,
             &image.data,
         )?;
         Ok(scale_for_cache(&rgba, max_cache_edge))
