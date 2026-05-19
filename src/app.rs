@@ -78,7 +78,9 @@ impl OverviewApp {
                 .context("failed while polling for X11 event")?
             {
                 if let Some(result) = self.handle_event(event, &mut layout)? {
-                    if let Some(sweep) = sweep.as_mut() {
+                    if result.is_none()
+                        && let Some(sweep) = sweep.as_mut()
+                    {
                         sweep.cancel();
                     }
                     return Ok(result);
@@ -110,7 +112,9 @@ impl OverviewApp {
                 .wait_for_event()
                 .context("failed while waiting for X11 event")?;
             if let Some(result) = self.handle_event(event, &mut layout)? {
-                if let Some(sweep) = sweep.as_mut() {
+                if result.is_none()
+                    && let Some(sweep) = sweep.as_mut()
+                {
                     sweep.cancel();
                 }
                 return Ok(result);
@@ -137,7 +141,18 @@ impl OverviewApp {
                     match action {
                         KeyAction::Close => return Ok(Some(None)),
                         KeyAction::Confirm => {
-                            return Ok(Some(Some(self.windows[self.selected].clone())));
+                            let window = self.windows[self.selected].clone();
+                            if self.debug {
+                                eprintln!(
+                                    "confirm: keyboard selected index={} ws={} con={:?} window=0x{:08x} name={}",
+                                    self.selected,
+                                    window.workspace,
+                                    window.i3_con_id,
+                                    window.id,
+                                    window.name
+                                );
+                            }
+                            return Ok(Some(Some(window)));
                         }
                         KeyAction::Left => self.move_left(layout),
                         KeyAction::Right => self.move_right(layout),
@@ -159,7 +174,20 @@ impl OverviewApp {
                 if u8::from(event.detail) == u8::from(ButtonIndex::M1) {
                     if let Some(index) = layout::hit_test(layout, event.event_x, event.event_y) {
                         self.selected = index;
-                        return Ok(Some(Some(self.windows[self.selected].clone())));
+                        let window = self.windows[self.selected].clone();
+                        if self.debug {
+                            eprintln!(
+                                "confirm: click selected index={} at {:+}{:+} ws={} con={:?} window=0x{:08x} name={}",
+                                self.selected,
+                                event.event_x,
+                                event.event_y,
+                                window.workspace,
+                                window.i3_con_id,
+                                window.id,
+                                window.name
+                            );
+                        }
+                        return Ok(Some(Some(window)));
                     }
                 }
             }

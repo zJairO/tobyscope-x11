@@ -118,11 +118,12 @@ pub fn focus_window(
     debug: bool,
 ) -> Result<()> {
     if let Some(con_id) = window.i3_con_id {
-        match crate::i3::focus_con(con_id, debug) {
+        match crate::i3::focus_con(con_id, &window.workspace, debug) {
             Ok(()) => return Ok(()),
             Err(error) if debug => {
                 eprintln!(
-                    "focus: i3 focus for con_id={con_id} failed, falling back to EWMH: {error:#}"
+                    "focus: i3 focus for workspace={} con_id={con_id} failed, falling back to EWMH: {error:#}",
+                    window.workspace
                 );
             }
             Err(_) => {}

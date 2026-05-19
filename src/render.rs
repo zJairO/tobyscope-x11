@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, bail};
 use image::RgbaImage;
 use image::imageops::FilterType;
-use x11rb::CURRENT_TIME;
 use x11rb::connection::Connection;
 use x11rb::protocol::render::{
     ConnectionExt as RenderConnectionExt, CreatePictureAux, Pictformat, Picture,
@@ -12,6 +11,7 @@ use x11rb::protocol::xproto::{
     Gcontext, GrabMode, GrabStatus, ImageFormat, Pixmap, PropMode, Rectangle, Window, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
+use x11rb::{CURRENT_TIME, NONE};
 
 use crate::cache::ThumbnailCache;
 use crate::layout::{Layout, Rect};
@@ -600,6 +600,28 @@ impl Overlay {
             );
         }
 
+        let pointer_grab = ctx
+            .conn
+            .grab_pointer(
+                false,
+                window,
+                EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                NONE,
+                NONE,
+                CURRENT_TIME,
+            )
+            .context("failed to request pointer grab")?
+            .reply()
+            .context("failed to receive pointer grab reply")?;
+        if pointer_grab.status != GrabStatus::SUCCESS {
+            bail!(
+                "could not grab pointer for overview overlay: {:?}",
+                pointer_grab.status
+            );
+        }
+
         ctx.conn.flush().context("failed to flush overlay setup")?;
 
         Ok(Self {
@@ -636,6 +658,9 @@ impl Overlay {
 
     fn destroy(&self, ctx: &X11Context) -> Result<()> {
         if let Ok(cookie) = ctx.conn.ungrab_keyboard(CURRENT_TIME) {
+            cookie.ignore_error();
+        }
+        if let Ok(cookie) = ctx.conn.ungrab_pointer(CURRENT_TIME) {
             cookie.ignore_error();
         }
         if let Ok(cookie) = ctx.conn.render_free_picture(self.picture) {

@@ -78,8 +78,11 @@ pub fn switch_workspace(name: &str, debug: bool) -> Result<()> {
     run_checked_command(&command)
 }
 
-pub fn focus_con(con_id: i64, debug: bool) -> Result<()> {
-    let command = format!("[con_id={con_id}] focus");
+pub fn focus_con(con_id: i64, workspace: &str, debug: bool) -> Result<()> {
+    let command = format!(
+        "workspace \"{}\"; [con_id={con_id}] focus",
+        escape_i3_string(workspace)
+    );
     if debug {
         eprintln!("i3: {command}");
     }
