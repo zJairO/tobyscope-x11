@@ -32,6 +32,7 @@ pub fn compute(screen_width: u16, screen_height: u16, windows: &[WindowInfo]) ->
     let count = windows.len().max(1);
     let margin = 24u16.min(screen_width / 10).min(screen_height / 10);
     let gap = if count <= 3 { 12u16 } else { 18u16 };
+    let top_meta_height = 40u16;
     let label_height = 34u16;
     let padding = 12u16;
     let (columns, rows) = choose_grid(count, screen_width, screen_height);
@@ -61,7 +62,7 @@ pub fn compute(screen_width: u16, screen_height: u16, windows: &[WindowInfo]) ->
     let items = windows
         .iter()
         .enumerate()
-        .map(|(index, window)| {
+        .map(|(index, _window)| {
             let col = index % columns;
             let row = index / columns;
             let x = start_x + (col as i16 * (cell_width + gap) as i16);
@@ -75,19 +76,17 @@ pub fn compute(screen_width: u16, screen_height: u16, windows: &[WindowInfo]) ->
 
             let preview_area = Rect {
                 x: x + padding as i16,
-                y: y + padding as i16,
+                y: y + top_meta_height as i16,
                 width: cell_width.saturating_sub(padding * 2),
                 height: cell_height
+                    .saturating_sub(top_meta_height)
                     .saturating_sub(label_height)
-                    .saturating_sub(padding * 2),
+                    .saturating_sub(padding),
             };
-            let preview = fit_aspect(
-                preview_area,
-                window.geometry.width.max(1),
-                window.geometry.height.max(1),
-            );
-
-            LayoutItem { cell, preview }
+            LayoutItem {
+                cell,
+                preview: preview_area,
+            }
         })
         .collect();
 
@@ -114,33 +113,4 @@ fn choose_grid(count: usize, screen_width: u16, screen_height: u16) -> (usize, u
     columns = columns.min(count);
     let rows = count.div_ceil(columns).max(1);
     (columns, rows)
-}
-
-fn fit_aspect(area: Rect, source_width: u16, source_height: u16) -> Rect {
-    if area.width == 0 || area.height == 0 {
-        return area;
-    }
-
-    let area_ratio = area.width as f32 / area.height as f32;
-    let source_ratio = source_width as f32 / source_height as f32;
-    let (width, height) = if source_ratio > area_ratio {
-        let width = area.width;
-        let height = ((width as f32 / source_ratio).round() as u16)
-            .max(1)
-            .min(area.height);
-        (width, height)
-    } else {
-        let height = area.height;
-        let width = ((height as f32 * source_ratio).round() as u16)
-            .max(1)
-            .min(area.width);
-        (width, height)
-    };
-
-    Rect {
-        x: area.x + ((area.width - width) / 2) as i16,
-        y: area.y + ((area.height - height) / 2) as i16,
-        width,
-        height,
-    }
 }

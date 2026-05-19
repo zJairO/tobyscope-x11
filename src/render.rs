@@ -28,7 +28,6 @@ const COLOR_TEXT: u32 = 0xe8edf2;
 const COLOR_MUTED: u32 = 0x95a3b2;
 const COLOR_ERROR: u32 = 0x66303a;
 const COLOR_EMPTY: u32 = 0x151b21;
-const COLOR_BADGE: u32 = 0x26394d;
 const APP_ID: &str = "tobyscope-x11";
 
 pub struct Renderer {
@@ -55,7 +54,6 @@ struct Gcs {
     muted: Gcontext,
     error: Gcontext,
     empty: Gcontext,
-    badge: Gcontext,
     image: Gcontext,
     font: Font,
 }
@@ -264,6 +262,15 @@ impl Renderer {
         if rect.width == 0 || rect.height == 0 {
             return Ok(());
         }
+        let Some((source_width, source_height)) = self
+            .thumbnails
+            .get(index)
+            .and_then(|slot| slot.state.image())
+            .map(|image| (image.width(), image.height()))
+        else {
+            return Ok(());
+        };
+        let target = fit_image(rect, source_width, source_height);
         let Some(slot) = self.thumbnails.get_mut(index) else {
             return Ok(());
         };
@@ -272,7 +279,7 @@ impl Renderer {
             self.overlay.window,
             self.overlay.gcs.image,
             ctx.root_depth,
-            rect,
+            target,
         )?
         else {
             return Ok(());
@@ -284,10 +291,10 @@ impl Renderer {
                 self.overlay.gcs.image,
                 0,
                 0,
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
+                target.x,
+                target.y,
+                target.width,
+                target.height,
             )
             .context("failed to copy prepared thumbnail")?
             .check()
@@ -333,7 +340,6 @@ impl Renderer {
             width,
             height: 22,
         };
-        self.fill(ctx, rect, self.overlay.gcs.badge)?;
         let marker = if urgent {
             "! "
         } else if focused {
@@ -342,7 +348,7 @@ impl Renderer {
             ""
         };
         let label = format!("{marker}{workspace}");
-        self.draw_text(ctx, rect.x + 6, rect.y + 15, &label, 20)
+        self.draw_text_without_background(ctx, rect.x + 6, rect.y + 15, &label, 20)
     }
 
     fn draw_label(&self, ctx: &X11Context, cell: Rect, label: &str) -> Result<()> {
@@ -350,7 +356,7 @@ impl Renderer {
         let max_chars = (usize::from(cell.width) / 7)
             .saturating_sub(2)
             .clamp(12, 120);
-        self.draw_text(ctx, cell.x + 10, y, label, max_chars)
+        self.draw_text_without_background(ctx, cell.x + 10, y, label, max_chars)
     }
 
     fn draw_border(&self, ctx: &X11Context, rect: Rect, selected: bool) -> Result<()> {
@@ -433,6 +439,32 @@ impl Renderer {
         ctx.conn
             .image_text8(self.overlay.buffer, gc, x, y, &bytes)
             .context("failed to draw text")?;
+        Ok(())
+    }
+
+    fn draw_text_without_background(
+        &self,
+        ctx: &X11Context,
+        x: i16,
+        y: i16,
+        text: &str,
+        max: usize,
+    ) -> Result<()> {
+        let bytes = ascii_label(text, max);
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        let mut items = Vec::with_capacity(bytes.len() + 2);
+        for chunk in bytes.chunks(254) {
+            items.push(chunk.len() as u8);
+            items.push(0);
+            items.extend_from_slice(chunk);
+        }
+
+        ctx.conn
+            .poly_text8(self.overlay.buffer, self.overlay.gcs.text, x, y, &items)
+            .context("failed to draw text without background")?;
         Ok(())
     }
 }
@@ -700,7 +732,6 @@ impl Gcs {
             muted: create_gc(ctx, drawable, COLOR_MUTED, COLOR_BACKGROUND, font)?,
             error: create_gc(ctx, drawable, COLOR_ERROR, COLOR_ERROR, font)?,
             empty: create_gc(ctx, drawable, COLOR_EMPTY, COLOR_EMPTY, font)?,
-            badge: create_gc(ctx, drawable, COLOR_BADGE, COLOR_BADGE, font)?,
             image: create_gc(ctx, drawable, COLOR_TEXT, COLOR_BACKGROUND, font)?,
             font,
         })
@@ -717,7 +748,6 @@ impl Gcs {
             self.muted,
             self.error,
             self.empty,
-            self.badge,
             self.image,
         ] {
             if let Ok(cookie) = ctx.conn.free_gc(gc) {
@@ -838,4 +868,40 @@ fn ascii_label(text: &str, max: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+fn fit_image(area: Rect, source_width: u32, source_height: u32) -> Rect {
+    if area.width == 0 || area.height == 0 || source_width == 0 || source_height == 0 {
+        return area;
+    }
+
+    let area_width = u32::from(area.width);
+    let area_height = u32::from(area.height);
+    let source_width = u64::from(source_width);
+    let source_height = u64::from(source_height);
+    let (width, height) =
+        if source_width * u64::from(area_height) > source_height * u64::from(area_width) {
+            let width = area_width;
+            let height = rounded_div(u64::from(width) * source_height, source_width)
+                .max(1)
+                .min(area_height);
+            (width, height)
+        } else {
+            let height = area_height;
+            let width = rounded_div(u64::from(height) * source_width, source_height)
+                .max(1)
+                .min(area_width);
+            (width, height)
+        };
+
+    Rect {
+        x: area.x + ((area_width - width) / 2) as i16,
+        y: area.y + ((area_height - height) / 2) as i16,
+        width: width as u16,
+        height: height as u16,
+    }
+}
+
+fn rounded_div(value: u64, divisor: u64) -> u32 {
+    ((value + divisor / 2) / divisor) as u32
 }
