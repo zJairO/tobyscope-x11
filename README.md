@@ -14,7 +14,7 @@ The repository and release must be public for these URLs to work without GitHub
 permissions.
 
 ```bash
-version=v0.2.0
+version=v0.2.1
 curl -LO "https://github.com/zJairO/tobyscope-x11/releases/download/${version}/tobyscope-x11-linux-x86_64.tar.gz"
 curl -LO "https://github.com/zJairO/tobyscope-x11/releases/download/${version}/SHA256SUMS"
 sha256sum -c SHA256SUMS
@@ -91,6 +91,7 @@ Controls:
 - Enter: focus the selected window.
 - Mouse hover: select a window.
 - Left click: focus the clicked window.
+- Left click a card's `X`: close that window and keep the overview open.
 - Escape or the Super/Windows key: close without changing focus.
 
 ## i3 Binding
@@ -162,6 +163,9 @@ muted = "#95a3b2"
 error = "#66303a"
 empty = "#151b21"
 shadow = "#05080c"
+close_button = "#ffffff"
+close_button_border = "#ffffff"
+close_button_text = "#000000"
 
 [layout]
 margin = 24
@@ -186,6 +190,8 @@ Notes:
 - `font` is a Pango/Fontconfig description, for example `Iosevka Term 11`.
   Polybar-style values such as `Iosevka Term:size=11;2` are accepted too.
 - Colors must be `#RRGGBB`.
+- `close_button`, `close_button_border`, and `close_button_text` control the
+  per-card close button.
 - Partial configs are allowed; missing values use built-in defaults.
 - `show_overlay_background = false` avoids painting the dark fullscreen
   background. The overlay is still an X11 window, so compositor behavior can
@@ -239,8 +245,8 @@ To publish a release:
 git status --short
 cargo check
 cargo build --release --locked
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 The GitHub Actions release workflow builds the Linux x86_64 tarball, creates

@@ -184,13 +184,7 @@ impl OverviewApp {
     }
 
     fn event_loop(&mut self) -> Result<Option<WindowInfo>> {
-        let mut sweep = Some(CaptureSweep::new(
-            &self.windows,
-            &self.cache,
-            self.config.thumbnails.max_cache_edge,
-            self.debug,
-            CaptureScope::AllWorkspaces,
-        ));
+        self.start_capture(CaptureScope::AllWorkspaces);
         self.redraw()?;
         self.renderer.show(&self.ctx)?;
         let mut layout = self.redraw()?;
@@ -204,15 +198,16 @@ impl OverviewApp {
             {
                 if let Some(result) = self.handle_event(event, &mut layout)? {
                     if result.is_none()
-                        && let Some(sweep) = sweep.as_mut()
+                        && let Some(sweep) = self.sweep.as_mut()
                     {
                         sweep.cancel();
                     }
+                    self.sweep = None;
                     return Ok(result);
                 }
             }
 
-            if let Some(active_sweep) = sweep.as_mut() {
+            if let Some(active_sweep) = self.sweep.as_mut() {
                 match active_sweep.step(
                     &self.ctx,
                     &self.cache,
@@ -224,7 +219,7 @@ impl OverviewApp {
                         continue;
                     }
                     SweepStatus::Finished => {
-                        sweep = None;
+                        self.sweep = None;
                         layout = self.redraw()?;
                         continue;
                     }
@@ -238,10 +233,11 @@ impl OverviewApp {
                 .context("failed while waiting for X11 event")?;
             if let Some(result) = self.handle_event(event, &mut layout)? {
                 if result.is_none()
-                    && let Some(sweep) = sweep.as_mut()
+                    && let Some(sweep) = self.sweep.as_mut()
                 {
                     sweep.cancel();
                 }
+                self.sweep = None;
                 return Ok(result);
             }
         }
@@ -302,6 +298,15 @@ impl OverviewApp {
             }
             Event::ButtonPress(event) => {
                 if u8::from(event.detail) == u8::from(ButtonIndex::M1) {
+                    if let Some(index) =
+                        layout::hit_test_close_button(layout, event.event_x, event.event_y)
+                    {
+                        if self.close_window_at(index)? {
+                            return Ok(Some(None));
+                        }
+                        *layout = self.current_layout()?;
+                        return Ok(None);
+                    }
                     if let Some(index) = layout::hit_test(layout, event.event_x, event.event_y) {
                         self.selected = index;
                         let window = self.windows[self.selected].clone();
@@ -362,6 +367,48 @@ impl OverviewApp {
             scope,
         );
         self.sweep = (!sweep.is_empty()).then_some(sweep);
+    }
+
+    fn close_window_at(&mut self, index: usize) -> Result<bool> {
+        let Some(window) = self.windows.get(index).cloned() else {
+            return Ok(false);
+        };
+        if self.debug {
+            eprintln!(
+                "close: click selected index={} ws={} con={:?} window=0x{:08x} name={}",
+                index, window.workspace, window.i3_con_id, window.id, window.name
+            );
+        }
+
+        match windows::close_window(&self.ctx, &self.atoms, &window, self.debug) {
+            Ok(()) => {}
+            Err(error) => {
+                if self.debug {
+                    eprintln!(
+                        "close: failed for index={} window=0x{:08x} `{}`: {error:#}",
+                        index, window.id, window.name
+                    );
+                }
+                return Ok(false);
+            }
+        }
+
+        if let Some(sweep) = self.sweep.as_mut() {
+            sweep.cancel();
+        }
+        self.sweep = None;
+        self.windows.remove(index);
+        self.renderer.remove_thumbnail(&self.ctx, index);
+        if self.windows.is_empty() {
+            return Ok(true);
+        }
+        if self.selected >= self.windows.len() {
+            self.selected = self.windows.len() - 1;
+        } else if index <= self.selected && self.selected > 0 {
+            self.selected -= 1;
+        }
+        self.prepare_frame()?;
+        Ok(false)
     }
 
     fn finish_interaction(&mut self, result: Option<WindowInfo>) -> Result<AppTick> {

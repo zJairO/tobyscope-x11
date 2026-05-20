@@ -106,6 +106,14 @@ pub fn focus_con(con_id: i64, workspace: &str, debug: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn close_con(con_id: i64, debug: bool) -> Result<()> {
+    let command = format!("[con_id={con_id}] close");
+    if debug {
+        eprintln!("i3: {command}");
+    }
+    run_checked_command(&command)
+}
+
 fn run_checked_command(command: &str) -> Result<()> {
     let mut connection = I3Connection::connect().context("failed to connect to i3 IPC")?;
     let reply = connection

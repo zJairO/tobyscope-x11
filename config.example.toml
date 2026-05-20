@@ -21,6 +21,9 @@ muted = "#95a3b2"
 error = "#66303a"
 empty = "#151b21"
 shadow = "#05080c"
+close_button = "#ffffff"
+close_button_border = "#ffffff"
+close_button_text = "#000000"
 
 [layout]
 margin = 24

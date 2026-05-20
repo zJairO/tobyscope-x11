@@ -130,14 +130,19 @@ pub fn model_key(windows: &[WindowInfo]) -> Vec<String> {
         .iter()
         .map(|window| {
             format!(
-                "{}:{:?}:{}:{}:{}:{}:{}",
+                "{}:{:?}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
                 window.id,
                 window.i3_con_id,
                 window.workspace,
                 window.tree_order,
                 window.urgent,
                 window.class.as_deref().unwrap_or(""),
-                window.instance.as_deref().unwrap_or("")
+                window.instance.as_deref().unwrap_or(""),
+                window.geometry.x,
+                window.geometry.y,
+                window.geometry.width,
+                window.geometry.height,
+                window.geometry.visual
             )
         })
         .collect()
@@ -262,6 +267,68 @@ pub fn focus_window(
         cookie.ignore_error();
     }
     ctx.conn.flush().context("failed to flush focus requests")?;
+    Ok(())
+}
+
+pub fn close_window(
+    ctx: &X11Context,
+    atoms: &Atoms,
+    window: &WindowInfo,
+    debug: bool,
+) -> Result<()> {
+    if let Some(con_id) = window.i3_con_id {
+        match crate::i3::close_con(con_id, debug) {
+            Ok(()) => return Ok(()),
+            Err(error) if debug => {
+                eprintln!(
+                    "close: i3 close for workspace={} con_id={con_id} failed, falling back to WM_DELETE_WINDOW: {error:#}",
+                    window.workspace
+                );
+            }
+            Err(_) => {}
+        }
+    }
+
+    close_with_wm_delete(ctx, atoms, window)
+}
+
+fn close_with_wm_delete(ctx: &X11Context, atoms: &Atoms, window: &WindowInfo) -> Result<()> {
+    let protocols = ctx
+        .conn
+        .get_property(
+            false,
+            window.id,
+            atoms.wm_protocols,
+            AtomEnum::ATOM,
+            0,
+            1024,
+        )
+        .context("failed to request WM_PROTOCOLS")?
+        .reply()
+        .context("failed to read WM_PROTOCOLS")?;
+    let supports_delete = protocols
+        .value32()
+        .is_some_and(|mut values| values.any(|atom| atom == atoms.wm_delete_window));
+    if !supports_delete {
+        anyhow::bail!("window does not advertise WM_DELETE_WINDOW");
+    }
+
+    let event = ClientMessageEvent {
+        response_type: CLIENT_MESSAGE_EVENT,
+        format: 32,
+        sequence: 0,
+        window: window.id,
+        type_: atoms.wm_protocols,
+        data: ClientMessageData::from([atoms.wm_delete_window, CURRENT_TIME, 0, 0, 0]),
+    };
+    ctx.conn
+        .send_event(false, window.id, EventMask::NO_EVENT, event)
+        .context("failed to send WM_DELETE_WINDOW client message")?
+        .check()
+        .context("WM_DELETE_WINDOW client message was rejected by X11")?;
+    ctx.conn
+        .flush()
+        .context("failed to flush close window request")?;
     Ok(())
 }
 

@@ -39,6 +39,9 @@ pub struct ColorConfig {
     pub error: u32,
     pub empty: u32,
     pub shadow: u32,
+    pub close_button: u32,
+    pub close_button_border: u32,
+    pub close_button_text: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -114,6 +117,9 @@ struct RawColorConfig {
     error: Option<String>,
     empty: Option<String>,
     shadow: Option<String>,
+    close_button: Option<String>,
+    close_button_border: Option<String>,
+    close_button_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -220,6 +226,16 @@ impl AppConfig {
             if let Some(value) = colors.shadow {
                 config.colors.shadow = parse_color("colors.shadow", &value)?;
             }
+            if let Some(value) = colors.close_button {
+                config.colors.close_button = parse_color("colors.close_button", &value)?;
+            }
+            if let Some(value) = colors.close_button_border {
+                config.colors.close_button_border =
+                    parse_color("colors.close_button_border", &value)?;
+            }
+            if let Some(value) = colors.close_button_text {
+                config.colors.close_button_text = parse_color("colors.close_button_text", &value)?;
+            }
         }
 
         if let Some(layout) = raw.layout {
@@ -303,6 +319,9 @@ impl Default for AppConfig {
                 error: 0x66303a,
                 empty: 0x151b21,
                 shadow: 0x05080c,
+                close_button: 0xffffff,
+                close_button_border: 0xffffff,
+                close_button_text: 0x000000,
             },
             layout: LayoutConfig {
                 margin: 24,

@@ -433,8 +433,15 @@ impl DaemonState {
 
     fn refresh_hidden_state(&mut self) -> Result<bool> {
         let interval = Duration::from_millis(self.config.daemon.idle_refresh_ms);
+        let model_interval = Duration::from_millis(
+            self.config
+                .daemon
+                .idle_refresh_ms
+                .saturating_mul(4)
+                .max(1000),
+        );
         let should_check_config = self.last_refresh.elapsed() >= interval;
-        let should_check_model = self.dirty && self.last_model_check.elapsed() >= interval;
+        let should_check_model = self.dirty || self.last_model_check.elapsed() >= model_interval;
         if !should_check_config && !should_check_model {
             return Ok(false);
         }

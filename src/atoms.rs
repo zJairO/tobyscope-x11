@@ -8,6 +8,8 @@ pub struct Atoms {
     pub net_client_list_stacking: Atom,
     pub net_wm_name: Atom,
     pub net_active_window: Atom,
+    pub wm_protocols: Atom,
+    pub wm_delete_window: Atom,
     pub utf8_string: Atom,
 }
 
@@ -18,6 +20,8 @@ impl Atoms {
             net_client_list_stacking: intern(conn, b"_NET_CLIENT_LIST_STACKING")?,
             net_wm_name: intern(conn, b"_NET_WM_NAME")?,
             net_active_window: intern(conn, b"_NET_ACTIVE_WINDOW")?,
+            wm_protocols: intern(conn, b"WM_PROTOCOLS")?,
+            wm_delete_window: intern(conn, b"WM_DELETE_WINDOW")?,
             utf8_string: intern(conn, b"UTF8_STRING")?,
         })
     }

@@ -21,6 +21,7 @@ impl Rect {
 pub struct LayoutItem {
     pub cell: Rect,
     pub preview: Rect,
+    pub close_button: Rect,
 }
 
 #[derive(Debug, Clone)]
@@ -105,9 +106,19 @@ pub fn compute(
                     .saturating_sub(label_height)
                     .saturating_sub(padding),
             };
+            let close_size = cell_width.min(cell_height).min(26).max(1);
+            let close_button = Rect {
+                x: x + cell_width
+                    .saturating_sub(padding)
+                    .saturating_sub(close_size) as i16,
+                y: y + 8,
+                width: close_size,
+                height: close_size,
+            };
             LayoutItem {
                 cell,
                 preview: preview_area,
+                close_button,
             }
         })
         .collect();
@@ -120,6 +131,13 @@ pub fn hit_test(layout: &Layout, x: i16, y: i16) -> Option<usize> {
         .items
         .iter()
         .position(|item| item.cell.contains(x, y))
+}
+
+pub fn hit_test_close_button(layout: &Layout, x: i16, y: i16) -> Option<usize> {
+    layout
+        .items
+        .iter()
+        .position(|item| item.close_button.contains(x, y))
 }
 
 fn choose_grid(count: usize, screen_width: u16, screen_height: u16) -> (usize, usize) {

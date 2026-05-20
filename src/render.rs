@@ -12,8 +12,8 @@ use x11rb::protocol::render::{
     QueryPictFormatsReply,
 };
 use x11rb::protocol::xproto::{
-    AtomEnum, ConfigureWindowAux, ConnectionExt as XprotoConnectionExt, CreateGCAux,
-    CreateWindowAux, EventMask, Font, Gcontext, GrabMode, GrabStatus, ImageFormat, Pixmap,
+    AtomEnum, ConfigureWindowAux, ConnectionExt as XprotoConnectionExt, CoordMode, CreateGCAux,
+    CreateWindowAux, EventMask, Font, Gcontext, GrabMode, GrabStatus, ImageFormat, Pixmap, Point,
     PropMode, Rectangle, Window, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
@@ -58,6 +58,9 @@ struct Gcs {
     error: Gcontext,
     empty: Gcontext,
     shadow: Gcontext,
+    close_button: Gcontext,
+    close_button_border: Gcontext,
+    close_mark: Gcontext,
     image: Gcontext,
     font: Font,
 }
@@ -256,6 +259,13 @@ impl Renderer {
         }
     }
 
+    pub fn remove_thumbnail(&mut self, ctx: &X11Context, index: usize) {
+        if index < self.thumbnails.len() {
+            let mut slot = self.thumbnails.remove(index);
+            slot.release_prepared(ctx);
+        }
+    }
+
     pub fn redraw(
         &mut self,
         ctx: &X11Context,
@@ -324,6 +334,7 @@ impl Renderer {
                 window.urgent,
                 cell_color,
             )?;
+            self.draw_close_button(ctx, item.close_button, index == selected, cell_color)?;
             let label = window.program_name();
             self.draw_label(ctx, item.cell, label.as_ref(), cell_color)?;
             if !self.config.ui.rounded_corners {
@@ -715,6 +726,140 @@ impl Renderer {
             self.config.colors.text,
             background,
         )
+    }
+
+    fn draw_close_button(
+        &mut self,
+        ctx: &X11Context,
+        rect: Rect,
+        _selected: bool,
+        cell_color: u32,
+    ) -> Result<()> {
+        if rect.width == 0 || rect.height == 0 {
+            return Ok(());
+        }
+
+        if self.config.ui.rounded_corners {
+            let radius = rounded_radius(rect, self.config.ui.corner_radius.min(8));
+            let key = PanelKey {
+                width: rect.width,
+                height: rect.height,
+                radius,
+                thickness: 1,
+                background: cell_color,
+                border: self.config.colors.close_button_border,
+                fill: self.config.colors.close_button,
+            };
+            let pixmap = self.ensure_panel_pixmap(ctx, key)?;
+            ctx.conn
+                .copy_area(
+                    pixmap,
+                    self.overlay.buffer,
+                    self.overlay.gcs.image,
+                    0,
+                    0,
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                )
+                .context("failed to copy close button")?
+                .check()
+                .context("X11 rejected close button copy")?;
+        } else {
+            self.fill(ctx, rect, self.overlay.gcs.close_button)?;
+            self.draw_close_button_border(ctx, rect)?;
+        }
+
+        self.draw_close_mark(ctx, rect)
+    }
+
+    fn draw_close_button_border(&self, ctx: &X11Context, rect: Rect) -> Result<()> {
+        let x2 = rect.x + rect.width as i16 - 1;
+        let y2 = rect.y + rect.height as i16 - 1;
+        let pieces = [
+            Rect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: 1,
+            },
+            Rect {
+                x: rect.x,
+                y: y2,
+                width: rect.width,
+                height: 1,
+            },
+            Rect {
+                x: rect.x,
+                y: rect.y,
+                width: 1,
+                height: rect.height,
+            },
+            Rect {
+                x: x2,
+                y: rect.y,
+                width: 1,
+                height: rect.height,
+            },
+        ];
+        for piece in pieces {
+            self.fill(ctx, piece, self.overlay.gcs.close_button_border)?;
+        }
+        Ok(())
+    }
+
+    fn draw_close_mark(&self, ctx: &X11Context, rect: Rect) -> Result<()> {
+        let pad = (rect.width.min(rect.height) / 3).max(5) as i16;
+        let left = rect.x.saturating_add(pad);
+        let top = rect.y.saturating_add(pad);
+        let right = rect
+            .x
+            .saturating_add(rect.width as i16)
+            .saturating_sub(pad)
+            .saturating_sub(1);
+        let bottom = rect
+            .y
+            .saturating_add(rect.height as i16)
+            .saturating_sub(pad)
+            .saturating_sub(1);
+        for offset in [0, 1] {
+            ctx.conn
+                .poly_line(
+                    CoordMode::ORIGIN,
+                    self.overlay.buffer,
+                    self.overlay.gcs.close_mark,
+                    &[
+                        Point {
+                            x: left.saturating_add(offset),
+                            y: top,
+                        },
+                        Point {
+                            x: right.saturating_add(offset),
+                            y: bottom,
+                        },
+                    ],
+                )
+                .context("failed to draw close button mark")?;
+            ctx.conn
+                .poly_line(
+                    CoordMode::ORIGIN,
+                    self.overlay.buffer,
+                    self.overlay.gcs.close_mark,
+                    &[
+                        Point {
+                            x: right.saturating_sub(offset),
+                            y: top,
+                        },
+                        Point {
+                            x: left.saturating_sub(offset),
+                            y: bottom,
+                        },
+                    ],
+                )
+                .context("failed to draw close button mark")?;
+        }
+        Ok(())
     }
 
     fn draw_label(&self, ctx: &X11Context, cell: Rect, label: &str, background: u32) -> Result<()> {
@@ -1280,6 +1425,27 @@ impl Gcs {
             error: create_gc(ctx, drawable, colors.error, colors.error, font)?,
             empty: create_gc(ctx, drawable, colors.empty, colors.empty, font)?,
             shadow: create_gc(ctx, drawable, colors.shadow, colors.background, font)?,
+            close_button: create_gc(
+                ctx,
+                drawable,
+                colors.close_button,
+                colors.close_button,
+                font,
+            )?,
+            close_button_border: create_gc(
+                ctx,
+                drawable,
+                colors.close_button_border,
+                colors.close_button,
+                font,
+            )?,
+            close_mark: create_gc(
+                ctx,
+                drawable,
+                colors.close_button_text,
+                colors.close_button,
+                font,
+            )?,
             image: create_gc(ctx, drawable, colors.text, colors.background, font)?,
             font,
         })
@@ -1297,6 +1463,9 @@ impl Gcs {
             self.error,
             self.empty,
             self.shadow,
+            self.close_button,
+            self.close_button_border,
+            self.close_mark,
             self.image,
         ] {
             if let Ok(cookie) = ctx.conn.free_gc(gc) {
